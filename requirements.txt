@@ -4,7 +4,7 @@ faiss-cpu>=1.7
 onnxruntime>=1.16
 fake-useragent>=1.4
 structlog>=23.0
-opencv-python>=4.8
+opencv-python-headless
 duckduckgo-search>=3.9
 beautifulsoup4>=4.12
 lxml>=4.9
