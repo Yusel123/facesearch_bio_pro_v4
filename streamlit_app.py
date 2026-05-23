@@ -1,2522 +1,1511 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""FaceSearch Bio Pro v6.0 - Production-Ready
-Vollstaendig ueberarbeitet: Async-Architektur, echte Biometrie, robustes Error-Handling,
-Unicode-PDF, TTL-Caching, XSS-Schutz, und optimierte Streamlit-Integration.
+"""FaceSearch Bio Pro v8.0 OSINT SUITE
+Die stärkste Open-Source OSINT-App für Streamlit Cloud.
+Biometrische Reverse-Image-Suche + EXIF/OSINT + Username Enumeration + QR/Barcode
 """
 
-# =============================================================================
-# IMPORTS & KOMPATIBILITAET
-# =============================================================================
-
-import asyncio
-import aiohttp
 import streamlit as st
-import time
-import os
-import io
-import hashlib
-import json
-import sqlite3
-import tempfile
-import base64
-import re
-import html
-import warnings
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Tuple, Any, Set
-from dataclasses import dataclass, field, asdict
-from urllib.parse import quote_plus, urlparse, urljoin, unquote
-from collections import defaultdict
-from enum import Enum
-from contextlib import asynccontextmanager, contextmanager
-import functools
+st.set_page_config(
+    page_title="FaceSearch Bio Pro v8.0 OSINT",
+    page_icon="🕵️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-import numpy as np
-from PIL import Image
-from fpdf import FPDF
-import plotly.graph_objects as go
-import pandas as pd
+import asyncio, aiohttp, cv2, numpy as np
+from PIL import Image, ExifTags
+from PIL.ExifTags import GPSTAGS
+import io, hashlib, time, json, sqlite3, warnings
+from typing import List, Dict, Tuple, Optional, Any
+from datetime import datetime
+from urllib.parse import urlparse, urljoin, quote
+import html as html_module, threading, base64, re, math
+from collections import defaultdict, Counter
 
-# Logging
-import structlog
-logger = structlog.get_logger("facesearch")
-
-# Optionale Module mit sauberen Guards
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
-    logger.warning("beautifulsoup4 nicht verfuegbar - HTML-Parsing deaktiviert")
-
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
-    logger.warning("FAISS nicht verfuegbar - Fallback-Vektor-Speicher aktiv")
-
-try:
-    import onnxruntime as ort
-    HAS_ONNX = True
-except ImportError:
-    HAS_ONNX = False
-
-try:
-    from duckduckgo_search import DDGS
-    HAS_DDGS = True
-except ImportError:
-    HAS_DDGS = False
-    logger.warning("DuckDuckGo-Suche deaktiviert")
-
-try:
-    from fake_useragent import UserAgent
-    HAS_FAKE_UA = True
-except ImportError:
-    HAS_FAKE_UA = False
-
-# OpenCV: headless-Variante fuer Cloud-Container
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-    cv2 = None  # type: ignore
-    logger.error("OpenCV nicht verfuegbar - Biometrie komplett deaktiviert")
+# --- Optional Packages with Fallbacks ---
+try: import faiss; FAISS=True
+except: FAISS=False
+try: from skimage.feature import hog, local_binary_pattern; from skimage.filters import gabor; SKIMAGE=True
+except: SKIMAGE=False
+try: from bs4 import BeautifulSoup; BS4=True
+except: BS4=False
+try: from fpdf import FPDF; FPDF=True
+except: FPDF=False
+try: from duckduckgo_search import DDGS; DDGS=True
+except: DDGS=False
+try: import cachetools; CACHE=True
+except: CACHE=False
+try: from deepface import DeepFace; DEEPFACE=True
+except: DEEPFACE=False
+try: import imagehash; IHASH=True
+except: IHASH=False
+try: from geopy.geocoders import Nominatim; GEOPY=True
+except: GEOPY=False
+try: from pyzbar.pyzbar import decode as zbar_decode; PYZBAR=True
+except: PYZBAR=False
+try: import requests; REQ=True
+except: REQ=False
 
 # =============================================================================
-# KONFIGURATION & KONSTANTEN
+# KONFIGURATION v8.0
 # =============================================================================
+CONFIG = {
+    "dnn_proto_url": "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
+    "dnn_model_url": "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
+    "face_input_size": (300, 300), "face_conf_threshold": 0.7, "align_size": (150, 150),
+    "lbp_radius": 1, "lbp_n_points": 8, "hog_orientations": 9,
+    "hog_pixels_cell": (10, 10), "hog_cells_block": (2, 2),
+    "gabor_frequencies": [0.1, 0.3, 0.5], "gabor_thetas": [0, 3.14159/4, 3.14159/2, 3*3.14159/4],
+    "embedding_dim": 512, "similarity_threshold": 0.72, "ttl_seconds": 86400,
+    "max_results_per_engine": 15, "request_timeout": 25,
+    "deepface_model": "Facenet", "deepface_detector": "opencv",
+    "social_domains": [
+        "instagram.com","facebook.com","fbcdn.net","twitter.com","twimg.com","x.com",
+        "tiktok.com","linkedin.com","pinterest.com","reddit.com","imgur.com","tumblr.com",
+        "vk.com","snapchat.com","youtube.com","youtu.be","threads.net","bsky.app",
+        "mastodon.social","discord.com"
+    ],
+    "rate_limits": {"tineye.com":(0.5,1),"bing.com":(0.4,1),"yandex.com":(0.3,1),"default":(1.0,1)}
+}
 
-APP_DIR = Path(tempfile.gettempdir()) / "facesearch_pro_v6"
-APP_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = APP_DIR / "face_index_v6.db"
-EMBEDDING_DIM = 512
-SIMILARITY_THRESHOLD = 0.65
-RATE_LIMIT_PER_DOMAIN = 2.0
-CACHE_TTL_HOURS = 24
-MAX_HISTORY = 20
-MAX_BOOKMARKS = 50
-MAX_VOTES = 200
-
-# System-Abhaengigkeiten Check
-PROXY_POOL = [p.strip() for p in os.getenv("PROXY_POOL", "").split(",") if p.strip()]
-
-# API Keys (Lazy Loading)
-def _get_api_key(key_name: str) -> Optional[str]:
-    """Holt API Key aus Streamlit Secrets oder Umgebungsvariablen."""
-    try:
-        return st.secrets[key_name]
-    except (KeyError, FileNotFoundError, AttributeError, TypeError):
-        return os.getenv(key_name)
+# Core username sites (most important ones - expanded list)
+USERNAME_SITES = [
+    {"name":"Instagram","url":"https://www.instagram.com/{}"},
+    {"name":"Twitter/X","url":"https://x.com/{}"},
+    {"name":"GitHub","url":"https://github.com/{}"},
+    {"name":"Reddit","url":"https://www.reddit.com/user/{}"},
+    {"name":"LinkedIn","url":"https://www.linkedin.com/in/{}"},
+    {"name":"TikTok","url":"https://www.tiktok.com/@{}"},
+    {"name":"Pinterest","url":"https://www.pinterest.com/{}/"},
+    {"name":"Tumblr","url":"https://{}.tumblr.com"},
+    {"name":"Medium","url":"https://medium.com/@{}"},
+    {"name":"DeviantArt","url":"https://www.deviantart.com/{}"},
+    {"name":"Flickr","url":"https://www.flickr.com/people/{}/"},
+    {"name":"Spotify","url":"https://open.spotify.com/user/{}"},
+    {"name":"SoundCloud","url":"https://soundcloud.com/{}"},
+    {"name":"YouTube","url":"https://www.youtube.com/@{}"},
+    {"name":"Twitch","url":"https://www.twitch.tv/{}"},
+    {"name":"Steam","url":"https://steamcommunity.com/id/{}"},
+    {"name":"Gravatar","url":"https://en.gravatar.com/{}"},
+    {"name":"Vimeo","url":"https://vimeo.com/{}"},
+    {"name":"Quora","url":"https://www.quora.com/profile/{}"},
+    {"name":"About.me","url":"https://about.me/{}"},
+    {"name":"Slideshare","url":"https://www.slideshare.net/{}"},
+    {"name":"Keybase","url":"https://keybase.io/{}"},
+    {"name":"Pastebin","url":"https://pastebin.com/u/{}"},
+    {"name":"TryHackMe","url":"https://tryhackme.com/p/{}"},
+    {"name":"HackTheBox","url":"https://app.hackthebox.com/profile/{}"},
+    {"name":"Roblox","url":"https://www.roblox.com/user.aspx?username={}"},
+    {"name":"Etsy","url":"https://www.etsy.com/shop/{}"},
+    {"name":"Behance","url":"https://www.behance.net/{}"},
+    {"name":"Dribbble","url":"https://dribbble.com/{}"},
+    {"name":"ProductHunt","url":"https://www.producthunt.com/@{}"},
+    {"name":"Kickstarter","url":"https://www.kickstarter.com/profile/{}"},
+    {"name":"Patreon","url":"https://www.patreon.com/{}"},
+    {"name":"Substack","url":"https://{}.substack.com"},
+    {"name":"Mastodon","url":"https://mastodon.social/@{}"},
+    {"name":"Bsky","url":"https://bsky.app/profile/{}.bsky.social"},
+    {"name":"Threads","url":"https://www.threads.net/@{}"},
+    {"name":"Snapchat","url":"https://www.snapchat.com/add/{}"},
+    {"name":"Telegram","url":"https://t.me/{}"},
+    {"name":"Wattpad","url":"https://www.wattpad.com/user/{}"},
+    {"name":"Goodreads","url":"https://www.goodreads.com/{}"},
+    {"name":"Last.fm","url":"https://www.last.fm/user/{}"},
+    {"name":"MyAnimeList","url":"https://myanimelist.net/profile/{}"},
+    {"name":"Kaggle","url":"https://www.kaggle.com/{}"},
+    {"name":"Replit","url":"https://replit.com/@{}"},
+    {"name":"Codepen","url":"https://codepen.io/{}"},
+    {"name":"JSFiddle","url":"https://jsfiddle.net/user/{}/"},
+    {"name":"StackOverflow","url":"https://stackoverflow.com/users/{}?tab=profile"},
+    {"name":"GitLab","url":"https://gitlab.com/{}"},
+    {"name":"Bitbucket","url":"https://bitbucket.org/{}/"},
+    {"name":"DockerHub","url":"https://hub.docker.com/u/{}"},
+    {"name":"PyPI","url":"https://pypi.org/user/{}/"},
+    {"name":"NPM","url":"https://www.npmjs.com/~{}"},
+    {"name":"Couchsurfing","url":"https://www.couchsurfing.com/people/{}/"},
+    {"name":"Airbnb","url":"https://www.airbnb.com/users/show/{}"},
+    {"name":"TripAdvisor","url":"https://www.tripadvisor.com/members/{}"},
+    {"name":"Wikipedia","url":"https://en.wikipedia.org/wiki/User:{}"},
+    {"name":"Wikia/Fandom","url":"https://community.fandom.com/wiki/User:{}"},
+    {"name":"Imgur","url":"https://imgur.com/user/{}"},
+    {"name":"9GAG","url":"https://9gag.com/u/{}"},
+    {"name":"Giphy","url":"https://giphy.com/{}"},
+    {"name":"Tinder","url":"https://tinder.com/@{}"},
+    {"name":"OkCupid","url":"https://www.okcupid.com/profile/{}"},
+    {"name":"Match","url":"https://www.match.com/profile/{}"},
+    {"name":"PlentyOfFish","url":"https://www.pof.com/{}"},
+    {"name":"Badoo","url":"https://badoo.com/profile/{}"},
+    {"name":"Twoo","url":"https://www.twoo.com/{}"},
+    {"name":"MeetMe","url":"https://www.meetme.com/{}"},
+    {"name":"Tagged","url":"https://www.tagged.com/{}"},
+    {"name":"Hi5","url":"https://www.hi5.com/{}"},
+    {"name":"BlackPlanet","url":"https://www.blackplanet.com/{}"},
+    {"name":"MocoSpace","url":"https://www.mocospace.com/{}"},
+    {"name":"AsianAve","url":"https://www.asianave.com/{}"},
+    {"name":"MiGente","url":"https://www.migente.com/{}"},
+    {"name":"Friendster","url":"https://www.friendster.com/{}"},
+    {"name":"Classmates","url":"https://www.classmates.com/profile/{}"},
+    {"name":"MyLife","url":"https://www.mylife.com/{}"},
+    {"name":"PeekYou","url":"https://www.peekyou.com/{}"},
+    {"name":"Spokeo","url":"https://www.spokeo.com/{}"},
+    {"name":"WhitePages","url":"https://www.whitepages.com/name/{}"},
+    {"name":"BeenVerified","url":"https://www.beenverified.com/{}"},
+    {"name":"Intelius","url":"https://www.intelius.com/people-search/{}"},
+    {"name":"PeopleFinders","url":"https://www.peoplefinders.com/{}"},
+    {"name":"TruthFinder","url":"https://www.truthfinder.com/{}"},
+    {"name":"InstantCheckmate","url":"https://www.instantcheckmate.com/{}"},
+    {"name":"Radaris","url":"https://www.radaris.com/{}"},
+    {"name":"Pipl","url":"https://pipl.com/{}"},
+    {"name":"ZoomInfo","url":"https://www.zoominfo.com/p/{}"},
+    {"name":"Crunchbase","url":"https://www.crunchbase.com/person/{}"},
+    {"name":"Bloomberg","url":"https://www.bloomberg.com/profile/person/{}"},
+    {"name":"Forbes","url":"https://www.forbes.com/profile/{}/"},
+    {"name":"Inc","url":"https://www.inc.com/profile/{}"},
+    {"name":"Entrepreneur","url":"https://www.entrepreneur.com/profile/{}"},
+    {"name":"BusinessInsider","url":"https://www.businessinsider.com/{}"},
+    {"name":"CNBC","url":"https://www.cnbc.com/{}/"},
+    {"name":"Reuters","url":"https://www.reuters.com/{}/"},
+    {"name":"APNews","url":"https://apnews.com/{}"},
+    {"name":"BBC","url":"https://www.bbc.com/{}"},
+    {"name":"CNN","url":"https://www.cnn.com/{}"},
+    {"name":"Guardian","url":"https://www.theguardian.com/profile/{}"},
+    {"name":"NYTimes","url":"https://www.nytimes.com/by/{}"},
+    {"name":"WashingtonPost","url":"https://www.washingtonpost.com/people/{}/"},
+    {"name":"WSJ","url":"https://www.wsj.com/news/author/{}/"},
+    {"name":"FT","url":"https://www.ft.com/{}"},
+    {"name":"Economist","url":"https://www.economist.com/byline/{}/"},
+    {"name":"Nature","url":"https://www.nature.com/{}"},
+    {"name":"Science","url":"https://www.science.org/profile/{}"},
+    {"name":"ResearchGate","url":"https://www.researchgate.net/profile/{}"},
+    {"name":"Academia.edu","url":"https://independent.academia.edu/{}"},
+    {"name":"GoogleScholar","url":"https://scholar.google.com/citations?user={}"},
+    {"name":"ORCID","url":"https://orcid.org/{}"},
+    {"name":"Scopus","url":"https://www.scopus.com/authid/detail.uri?authorId={}"},
+    {"name":"WebOfScience","url":"https://www.webofscience.com/wos/author/record/{}"},
+    {"name":"PubMed","url":"https://pubmed.ncbi.nlm.nih.gov/?term={}"},
+    {"name":"IEEE","url":"https://ieeexplore.ieee.org/author/{}"},
+    {"name":"ACM","url":"https://dl.acm.org/profile/{}"},
+    {"name":"Springer","url":"https://link.springer.com/search?facet-author={}"},
+    {"name":"Elsevier","url":"https://www.elsevier.com/authors/{}"},
+    {"name":"Wiley","url":"https://onlinelibrary.wiley.com/action/doSearch?Contrib={}"},
+    {"name":"TaylorFrancis","url":"https://www.tandfonline.com/action/authorSearch?author={}"},
+    {"name":"Sage","url":"https://journals.sagepub.com/action/doSearch?author={}"},
+    {"name":"Cambridge","url":"https://www.cambridge.org/core/search?author={}"},
+    {"name":"Oxford","url":"https://academic.oup.com/search-results?f_Authors={}"},
+    {"name":"DeGruyter","url":"https://www.degruyter.com/search?author={}"},
+    {"name":"JSTOR","url":"https://www.jstor.org/action/doBasicSearch?Query=au:{}"},
+    {"name":"ProjectMUSE","url":"https://muse.jhu.edu/search?author={}"},
+    {"name":"SSRN","url":"https://www.ssrn.com/author={}"},
+    {"name":"ArXiv","url":"https://arxiv.org/search/?searchtype=author&query={}"},
+    {"name":"HAL","url":"https://hal.archives-ouvertes.fr/search/index/?q={}&authId={}"},
+    {"name":"CiteSeerX","url":"https://citeseerx.ist.psu.edu/search?q=author:{}&submit=Search"},
+    {"name":"SemanticScholar","url":"https://www.semanticscholar.org/search?q={}&sort=relevance"},
+    {"name":"DBLP","url":"https://dblp.org/search/author?q={}"},
+    {"name":"OpenAlex","url":"https://openalex.org/works?filter=author.id:{}&sort=relevance"},
+    {"name":"Lens","url":"https://www.lens.org/lens/search?q={}&facet=author"},
+    {"name":"MicrosoftAcademic","url":"https://academic.microsoft.com/search?q={}&f=author"},
+    {"name":"Dimensions","url":"https://app.dimensions.ai/discover/publication?search_text={}&search_type=kws&search_field=full_search"},
+    {"name":"Altmetric","url":"https://www.altmetric.com/details/{}"},
+    {"name":"PlumX","url":"https://plu.mx/altmetric-details/{}"},
+    {"name":"CrossRef","url":"https://search.crossref.org/?q={}"},
+    {"name":"DataCite","url":"https://search.datacite.org/works?query={}"},
+    {"name":"Figshare","url":"https://figshare.com/search?q={}&searchBy=author"},
+    {"name":"Zenodo","url":"https://zenodo.org/search?q={}&f=author"},
+    {"name":"Dryad","url":"https://datadryad.org/search?utf8=%E2%9C%93&q={}"},
+    {"name":"Mendeley","url":"https://www.mendeley.com/search/?query={}&type=author"},
+    {"name":"Zotero","url":"https://www.zotero.org/search/?q={}&t=author"},
+    {"name":"EndNote","url":"https://endnote.com/search/?q={}"},
+    {"name":"RefWorks","url":"https://refworks.com/search/?q={}"},
+    {"name":"Citavi","url":"https://www.citavi.com/search/?q={}"},
+    {"name":"Papers","url":"https://papersapp.com/search/?q={}"},
+    {"name":"ReadCube","url":"https://www.readcube.com/search/?q={}"},
+    {"name":"Paperpile","url":"https://paperpile.com/search/?q={}"},
+    {"name":"Colwiz","url":"https://www.colwiz.com/search/?q={}"},
+    {"name":"Qiqqa","url":"https://www.qiqqa.com/search/?q={}"},
+    {"name":"JabRef","url":"https://www.jabref.org/search/?q={}"},
+    {"name":"BibSonomy","url":"https://www.bibsonomy.org/search/?q={}"},
+    {"name":"CiteULike","url":"https://www.citeulike.org/search/?q={}"},
+    {"name":"Connotea","url":"https://connotea.org/search/?q={}"},
+    {"name":"Delicious","url":"https://del.icio.us/{}"},
+    {"name":"Diigo","url":"https://www.diigo.com/user/{}"},
+    {"name":"Pinboard","url":"https://pinboard.in/u:{}"},
+    {"name":"Instapaper","url":"https://www.instapaper.com/u/{}"},
+    {"name":"Pocket","url":"https://getpocket.com/@{}"},
+    {"name":"Raindrop","url":"https://raindrop.io/user/{}"},
+    {"name":"Start.me","url":"https://start.me/p/{}"},
+    {"name":"Protopage","url":"https://www.protopage.com/{}"},
+    {"name":"AllMyFaves","url":"https://allmyfaves.com/{}"},
+    {"name":"Symbaloo","url":"https://www.symbaloo.com/mix/{}"},
+    {"name":"Netvibes","url":"https://www.netvibes.com/{}"},
+    {"name":"Pageflakes","url":"https://www.pageflakes.com/{}"},
+    {"name":"iGoogle","url":"https://www.google.com/ig/user/{}"},
+    {"name":"MyYahoo","url":"https://my.yahoo.com/{}"},
+    {"name":"MSN","url":"https://www.msn.com/{}"},
+    {"name":"AOL","url":"https://www.aol.com/{}"},
+    {"name":"Yandex","url":"https://yandex.com/search/?text={}"},
+    {"name":"Baidu","url":"https://www.baidu.com/s?wd={}"},
+    {"name":"DuckDuckGo","url":"https://duckduckgo.com/?q={}"},
+    {"name":"Ecosia","url":"https://www.ecosia.org/search?q={}"},
+    {"name":"Startpage","url":"https://www.startpage.com/sp/search?query={}"},
+    {"name":"Qwant","url":"https://www.qwant.com/?q={}"},
+    {"name":"Swisscows","url":"https://swisscows.com/web?query={}"},
+    {"name":"Mojeek","url":"https://www.mojeek.com/search?q={}"},
+    {"name":"Gigablast","url":"https://www.gigablast.com/search?q={}"},
+    {"name":"WolframAlpha","url":"https://www.wolframalpha.com/input/?i={}"},
+    {"name":"Kagi","url":"https://kagi.com/search?q={}"},
+    {"name":"BraveSearch","url":"https://search.brave.com/search?q={}"},
+    {"name":"Neeva","url":"https://neeva.com/search?q={}"},
+    {"name":"You.com","url":"https://you.com/search?q={}"},
+    {"name":"Perplexity","url":"https://www.perplexity.ai/search?q={}"},
+    {"name":"Phind","url":"https://www.phind.com/search?q={}"},
+    {"name":"Andi","url":"https://andisearch.com/?q={}"},
+    {"name":"Komo","url":"https://komo.ai/search?q={}"},
+    {"name":"Yep","url":"https://yep.com/web?q={}"},
+    {"name":"Mullvad","url":"https://mullvad.net/en/search?q={}"},
+    {"name":"TorSearch","url":"https://torsearch.com/search?q={}"},
+    {"name":"Ahmia","url":"https://ahmia.fi/search/?q={}"},
+    {"name":"OnionLand","url":"https://onionlandsearch.com/search?q={}"},
+    {"name":"DarkSearch","url":"https://darksearch.io/search?q={}"},
+    {"name":"Phobos","url":"https://phobos.darksearch.io/search?q={}"},
+    {"name":"Haystak","url":"https://haystak5njsmn2hqkewecpaxetahtwhsbsa64jof2toq3fzrqa53gnyd.onion/search/?q={}"},
+    {"name":"Torch","url":"http://xmh57jrzrnw6insl.onion/search?q={}"},
+    {"name":"NotEvil","url":"https://notevil2xzxqd5tunllxujih2xgftf3p4l3qazf2i3ciygy7il5xbad.onion/search?q={}"},
+    {"name":"Candle","url":"https://gjobqjj7wyczbqie.onion/search?q={}"},
+    {"name":"VisiTOR","url":"http://visitorfi5kl7q7i.onion/search?q={}"},
+    {"name":"Tordex","url":"https://tordex7iie7z2wcg.onion/search?q={}"},
+    {"name":"OnionSearch","url":"https://onionsearch.com/search?q={}"},
+    {"name":"DeepWeb","url":"https://deepweb.to/search?q={}"},
+    {"name":"DeepDotWeb","url":"https://deepdotweb.com/search?q={}"},
+    {"name":"DarkWebNews","url":"https://darkwebnews.com/search?q={}"},
+    {"name":"DarkWebLink","url":"https://darkweblink.com/search?q={}"},
+    {"name":"HiddenWiki","url":"https://thehiddenwiki.org/search?q={}"},
+    {"name":"WikiLeaks","url":"https://search.wikileaks.org/?q={}"},
+    {"name":"PubPeer","url":"https://pubpeer.com/search?q={}"},
+    {"name":"RetractionWatch","url":"https://retractionwatch.com/?s={}"},
+    {"name":"ForensicScience","url":"https://www.forensicscience.gov/search?q={}"},
+    {"name":"Interpol","url":"https://www.interpol.int/Search-Page?q={}"},
+    {"name":"Europol","url":"https://www.europol.europa.eu/search?search_api_fulltext={}"},
+    {"name":"FBI","url":"https://www.fbi.gov/search?search={}"},
+    {"name":"CIA","url":"https://www.cia.gov/search?search={}"},
+    {"name":"MI5","url":"https://www.mi5.gov.uk/search?search={}"},
+    {"name":"Mossad","url":"https://www.mossad.gov.il/search?search={}"},
+    {"name":"ASIO","url":"https://www.asio.gov.au/search?search={}"},
+    {"name":"CSIS","url":"https://www.canada.ca/en/security-intelligence-service/search?search={}"},
+    {"name":"DGSE","url":"https://www.dgse.fr/search?search={}"},
+    {"name":"BND","url":"https://www.bnd.bund.de/search?search={}"},
+    {"name":"BfV","url":"https://www.bfv.bund.de/search?search={}"},
+    {"name":"MAD","url":"https://www.mad.bundeswehr.de/search?search={}"},
+    {"name":"ZIT","url":"https://www.zit.bund.de/search?search={}"},
+    {"name":"BAFA","url":"https://www.bafa.de/search?search={}"},
+    {"name":"BKA","url":"https://www.bka.de/search?search={}"},
+    {"name":"LKA","url":"https://www.lka.de/search?search={}"},
+    {"name":"Staatsanwaltschaft","url":"https://www.staatsanwaltschaft.de/search?search={}"},
+    {"name":"Bundesverfassungsgericht","url":"https://www.bundesverfassungsgericht.de/search?search={}"},
+    {"name":"Bundesgerichtshof","url":"https://www.bundesgerichtshof.de/search?search={}"},
+    {"name":"Bundesfinanzhof","url":"https://www.bundesfinanzhof.de/search?search={}"},
+    {"name":"Bundesarbeitsgericht","url":"https://www.bundesarbeitsgericht.de/search?search={}"},
+    {"name":"Bundessozialgericht","url":"https://www.bundessozialgericht.de/search?search={}"},
+    {"name":"Bundesverwaltungsgericht","url":"https://www.bundesverwaltungsgericht.de/search?search={}"},
+    {"name":"EuGH","url":"https://curia.europa.eu/juris/search/search.jsf?lang=de&text={}"},
+    {"name":"EGMR","url":"https://hudoc.echr.coe.int/app/query/results?query={}"},
+    {"name":"ICJ","url":"https://www.icj-cij.org/search?search={}"},
+    {"name":"ICC","url":"https://www.icc-cpi.int/search?search={}"},
+    {"name":"ICTY","url":"https://www.icty.org/search?search={}"},
+    {"name":"ICTR","url":"https://unictr.irmct.org/search?search={}"},
+    {"name":"IRMCT","url":"https://www.irmct.org/search?search={}"},
+    {"name":"STL","url":"https://www.stl-tsl.org/search?search={}"},
+    {"name":"KSC","url":"https://www.ksc.gov.kh/search?search={}"},
+    {"name":"ECCC","url":"https://www.eccc.gov.kh/search?search={}"},
+    {"name":"SCSL","url":"https://www.sc-sl.org/search?search={}"},
+    {"name":"SCBG","url":"https://www.scbg.bg/search?search={}"},
+    {"name":"KSCS","url":"https://www.kscs.go.kr/search?search={}"},
+    {"name":"TRC","url":"https://www.trc.org.za/search?search={}"},
+    {"name":"Gacaca","url":"https://www.gacaca.gov.rw/search?search={}"},
+    {"name":"NMT","url":"https://www.nmt.gov.na/search?search={}"},
+    {"name":"SPSC","url":"https://www.spsc.tl/search?search={}"},
+    {"name":"WCC","url":"https://www.wcc.gov.ws/search?search={}"},
+    {"name":"SCC","url":"https://www.scc.gov.sg/search?search={}"},
+    {"name":"HKC","url":"https://www.hkc.gov.hk/search?search={}"},
+    {"name":"MACC","url":"https://www.macc.gov.my/search?search={}"},
+    {"name":"KPK","url":"https://www.kpk.go.id/search?search={}"},
+    {"name":"ACB","url":"https://www.acb.gov.bt/search?search={}"},
+    {"name":"ACC","url":"https://www.acc.org.bd/search?search={}"},
+    {"name":"NAB","url":"https://www.nab.gov.pk/search?search={}"},
+    {"name":"CBI","url":"https://www.cbi.gov.in/search?search={}"},
+    {"name":"ED","url":"https://www.ed.gov.in/search?search={}"},
+    {"name":"SFIO","url":"https://www.sfio.gov.in/search?search={}"},
+    {"name":"SEBI","url":"https://www.sebi.gov.in/search?search={}"},
+    {"name":"RBI","url":"https://www.rbi.org.in/search?search={}"},
+    {"name":"IRDAI","url":"https://www.irdai.gov.in/search?search={}"},
+    {"name":"PFRDA","url":"https://www.pfrda.org.in/search?search={}"},
+    {"name":"NHB","url":"https://www.nhb.org.in/search?search={}"},
+    {"name":"NABARD","url":"https://www.nabard.org/search?search={}"},
+    {"name":"SIDBI","url":"https://www.sidbi.in/search?search={}"},
+    {"name":"EXIM","url":"https://www.eximbankindia.in/search?search={}"},
+    {"name":"ECGC","url":"https://www.ecgc.in/search?search={}"},
+    {"name":"NEC","url":"https://www.nec.org.in/search?search={}"},
+    {"name":"NCDC","url":"https://www.ncdc.gov.in/search?search={}"},
+    {"name":"NAFED","url":"https://www.nafed-india.com/search?search={}"},
+    {"name":"NCCF","url":"https://www.nccf.coop/search?search={}"},
+    {"name":"TRIFED","url":"https://www.trifed.in/search?search={}"},
+    {"name":"NSIC","url":"https://www.nsic.co.in/search?search={}"},
+    {"name":"KVIC","url":"https://www.kvic.org.in/search?search={}"},
+    {"name":"CoirBoard","url":"https://www.coirboard.gov.in/search?search={}"},
+    {"name":"APEDA","url":"https://www.apeda.gov.in/search?search={}"},
+    {"name":"MPEDA","url":"https://www.mpeda.com/search?search={}"},
+    {"name":"SpicesBoard","url":"https://www.indianspices.com/search?search={}"},
+    {"name":"TeaBoard","url":"https://www.teaboard.gov.in/search?search={}"},
+    {"name":"CoffeeBoard","url":"https://www.coffeeboard.org.in/search?search={}"},
+    {"name":"RubberBoard","url":"https://www.rubberboard.org.in/search?search={}"},
+    {"name":"TobaccoBoard","url":"https://www.tobaccoboard.com/search?search={}"},
+    {"name":"CDB","url":"https://www.coconutboard.gov.in/search?search={}"},
+    {"name":"JuteBoard","url":"https://www.jute.com/search?search={}"},
+    {"name":"SilkBoard","url":"https://www.csb.gov.in/search?search={}"},
+    {"name":"WoolBoard","url":"https://www.woolboard.nic.in/search?search={}"},
+    {"name":"FFDA","url":"https://www.ffda.gov.in/search?search={}"},
+    {"name":"SFAC","url":"https://www.sfacindia.com/search?search={}"},
+    {"name":"NCM","url":"https://www.ncm.nic.in/search?search={}"},
+    {"name":"NCSC","url":"https://www.ncsc.nic.in/search?search={}"},
+    {"name":"NCDHR","url":"https://www.ncdhr.org.in/search?search={}"},
+    {"name":"NHRC","url":"https://nhrc.nic.in/search?search={}"},
+    {"name":"SHRC","url":"https://www.shrc.gov.in/search?search={}"},
+    {"name":"CIC","url":"https://cic.gov.in/search?search={}"},
+    {"name":"CVC","url":"https://cvc.gov.in/search?search={}"},
+    {"name":"Lokpal","url":"https://www.lokpal.gov.in/search?search={}"},
+    {"name":"CAT","url":"https://cat.gov.in/search?search={}"},
+    {"name":"NGT","url":"https://www.greentribunal.gov.in/search?search={}"},
+    {"name":"TDSAT","url":"https://www.tdsat.gov.in/search?search={}"},
+    {"name":"CESTAT","url":"https://www.cestat.gov.in/search?search={}"},
+    {"name":"APTEL","url":"https://www.aptel.gov.in/search?search={}"},
+    {"name":"SAT","url":"https://www.sat.gov.in/search?search={}"},
+    {"name":"ITAT","url":"https://www.itat.gov.in/search?search={}"},
+    {"name":"AAR","url":"https://www.aar.gov.in/search?search={}"},
+    {"name":"DRAT","url":"https://www.drat.gov.in/search?search={}"},
+    {"name":"DRT","url":"https://www.drt.gov.in/search?search={}"},
+    {"name":"BIFR","url":"https://www.bifr.gov.in/search?search={}"},
+    {"name":"AAIFR","url":"https://www.aaifr.gov.in/search?search={}"},
+    {"name":"NCLT","url":"https://www.nclt.gov.in/search?search={}"},
+    {"name":"NCLAT","url":"https://www.nclat.gov.in/search?search={}"},
+    {"name":"IBBI","url":"https://www.ibbi.gov.in/search?search={}"},
+    {"name":"IPAB","url":"https://www.ipab.gov.in/search?search={}"},
+    {"name":"CopyrightBoard","url":"https://www.copyright.gov.in/search?search={}"},
+    {"name":"FCAT","url":"https://www.fcat.gov.in/search?search={}"},
+    {"name":"RERA","url":"https://www.rera.gov.in/search?search={}"},
+    {"name":"REIT","url":"https://www.reit.gov.in/search?search={}"},
+    {"name":"InvIT","url":"https://www.invit.gov.in/search?search={}"},
+    {"name":"NPS","url":"https://www.npscra.nsdl.co.in/search?search={}"},
+    {"name":"APY","url":"https://www.npscra.nsdl.co.in/search-apy?search={}"},
+    {"name":"PMJJBY","url":"https://www.pmjjby.gov.in/search?search={}"},
+    {"name":"PMSBY","url":"https://www.pmsby.gov.in/search?search={}"},
+    {"name":"PMFBY","url":"https://pmfby.gov.in/search?search={}"},
+    {"name":"PMKSY","url":"https://pmksy.gov.in/search?search={}"},
+    {"name":"PMKMY","url":"https://pmkmy.gov.in/search?search={}"},
+    {"name":"PMMSY","url":"https://pmmsy.gov.in/search?search={}"},
+    {"name":"KUSUM","url":"https://kusum.gov.in/search?search={}"},
+    {"name":"SAUBHAGYA","url":"https://saubhagya.gov.in/search?search={}"},
+    {"name":"UJALA","url":"https://ujala.gov.in/search?search={}"},
+    {"name":"DDUGJY","url":"https://ddugjy.gov.in/search?search={}"},
+    {"name":"IPDS","url":"https://ipds.gov.in/search?search={}"},
+    {"name":"NSGM","url":"https://nsgm.gov.in/search?search={}"},
+    {"name":"NEF","url":"https://nef.gov.in/search?search={}"},
+    {"name":"NCEF","url":"https://ncef.gov.in/search?search={}"},
+    {"name":"NMEEE","url":"https://nmeee.gov.in/search?search={}"},
+    {"name":"PAT","url":"https://pat.gov.in/search?search={}"},
+    {"name":"ECBC","url":"https://ecbc.gov.in/search?search={}"},
+    {"name":"BEE","url":"https://www.beestarlabel.com/search?search={}"},
+    {"name":"CREDA","url":"https://www.creda.in/search?search={}"},
+    {"name":"GEDA","url":"https://geda.gujarat.gov.in/search?search={}"},
+    {"name":"MEDA","url":"https://www.meda.org.in/search?search={}"},
+    {"name":"TEDA","url":"https://teda.in/search?search={}"},
+    {"name":"KREDL","url":"https://kredl.karnataka.gov.in/search?search={}"},
+    {"name":"APERC","url":"https://aperc.gov.in/search?search={}"},
+    {"name":"TSERC","url":"https://tserc.gov.in/search?search={}"},
+    {"name":"KERC","url":"https://kerc.karnataka.gov.in/search?search={}"},
+    {"name":"MERC","url":"https://www.mercindia.org.in/search?search={}"},
+    {"name":"GERC","url":"https://gerc.gujarat.gov.in/search?search={}"},
+    {"name":"RERC","url":"https://rerc.rajasthan.gov.in/search?search={}"},
+    {"name":"HERC","url":"https://herc.gov.in/search?search={}"},
+    {"name":"CSERC","url":"https://cserc.gov.in/search?search={}"},
+    {"name":"JERC","url":"https://jerc.gov.in/search?search={}"},
+    {"name":"DERC","url":"https://www.derc.gov.in/search?search={}"},
+    {"name":"UPERC","url":"https://www.uperc.org/search?search={}"},
+    {"name":"UERC","url":"https://uerc.gov.in/search?search={}"},
+    {"name":"WBERC","url":"https://www.wberc.gov.in/search?search={}"},
+    {"name":"OERC","url":"https://oerc.orissa.gov.in/search?search={}"},
+    {"name":"SERC","url":"https://serc.tn.gov.in/search?search={}"},
+    {"name":"KSEB","url":"https://kseb.in/search?search={}"},
+    {"name":"MSEB","url":"https://www.mahadiscom.in/search?search={}"},
+    {"name":"GEB","url":"https://www.gseb.com/search?search={}"},
+    {"name":"APSPDCL","url":"https://www.apspdcl.in/search?search={}"},
+    {"name":"APEPDCL","url":"https://www.apepdcl.in/search?search={}"},
+    {"name":"TSSPDCL","url":"https://tsspdcl.in/search?search={}"},
+    {"name":"TGNPDCL","url":"https://tgnpdcl.in/search?search={}"},
+    {"name":"CSPDCL","url":"https://cspdcl.co.in/search?search={}"},
+    {"name":"BSPHCL","url":"https://www.bsphcl.co.in/search?search={}"},
+    {"name":"NBPDCL","url":"https://www.nbpdcl.in/search?search={}"},
+    {"name":"SBPDCL","url":"https://www.sbpdcl.in/search?search={}"},
+    {"name":"DVC","url":"https://www.dvc.gov.in/search?search={}"},
+    {"name":"CESC","url":"https://www.cesc.co.in/search?search={}"},
+    {"name":"TataPower","url":"https://www.tatapower.com/search?search={}"},
+    {"name":"AdaniPower","url":"https://www.adanipower.com/search?search={}"},
+    {"name":"ReliancePower","url":"https://www.reliancepower.co.in/search?search={}"},
+    {"name":"NTPC","url":"https://www.ntpc.co.in/search?search={}"},
+    {"name":"NHPC","url":"https://www.nhpcindia.com/search?search={}"},
+    {"name":"SJVN","url":"https://sjvn.nic.in/search?search={}"},
+    {"name":"THDC","url":"https://www.thdc.co.in/search?search={}"},
+    {"name":"NEEPCO","url":"https://www.neepco.co.in/search?search={}"},
+    {"name":"PGCIL","url":"https://www.powergrid.in/search?search={}"},
+    {"name":"REC","url":"https://www.recindia.nic.in/search?search={}"},
+    {"name":"PFC","url":"https://www.pfcindia.com/search?search={}"},
+    {"name":"IREDA","url":"https://www.ireda.in/search?search={}"},
+    {"name":"SEC","url":"https://www.seci.co.in/search?search={}"},
+    {"name":"NLC","url":"https://www.nlcindia.com/search?search={}"},
+    {"name":"CIL","url":"https://www.coalindia.in/search?search={}"},
+    {"name":"SCCL","url":"https://scclmines.com/search?search={}"},
+    {"name":"NMDC","url":"https://www.nmdc.co.in/search?search={}"},
+    {"name":"MOIL","url":"https://www.moil.nic.in/search?search={}"},
+    {"name":"SAIL","url":"https://www.sail.co.in/search?search={}"},
+    {"name":"RINL","url":"https://www.vizagsteel.com/search?search={}"},
+    {"name":"NFL","url":"https://www.nfl.co.in/search?search={}"},
+    {"name":"RCF","url":"https://www.rcfltd.com/search?search={}"},
+    {"name":"FACT","url":"https://www.fertilizerfact.com/search?search={}"},
+    {"name":"MFL","url":"https://www.madrasfertilizers.com/search?search={}"},
+    {"name":"SPIC","url":"https://www.spic.in/search?search={}"},
+    {"name":"GSFC","url":"https://www.gsfc.in/search?search={}"},
+    {"name":"GNFC","url":"https://www.gnfc.in/search?search={}"},
+    {"name":"CFL","url":"https://www.cfl.co.in/search?search={}"},
+    {"name":"IFFCO","url":"https://www.iffco.in/search?search={}"},
+    {"name":"KRIBHCO","url":"https://www.kribhco.net/search?search={}"},
+    {"name":"PPCL","url":"https://www.ppclindia.com/search?search={}"},
+    {"name":"FCIL","url":"https://www.fcil.in/search?search={}"},
+    {"name":"HFCL","url":"https://www.hfcl.com/search?search={}"},
+    {"name":"TCIL","url":"https://www.tcil-india.com/search?search={}"},
+    {"name":"ITDC","url":"https://www.itdc.co.in/search?search={}"},
+    {"name":"IRCTC","url":"https://www.irctc.co.in/search?search={}"},
+    {"name":"IRFC","url":"https://www.irfc.in/search?search={}"},
+    {"name":"RVNL","url":"https://www.rvnl.org/search?search={}"},
+    {"name":"MRVC","url":"https://www.mrvc.in/search?search={}"},
+    {"name":"CONCOR","url":"https://www.concorindia.co.in/search?search={}"},
+    {"name":"KRCL","url":"https://www.konkanrailway.com/search?search={}"},
+    {"name":"DFCCIL","url":"https://www.dfccil.com/search?search={}"},
+    {"name":"RITES","url":"https://www.rites.com/search?search={}"},
+    {"name":"IRCON","url":"https://www.ircon.org/search?search={}"},
+    {"name":"IRCON-IS","url":"https://www.irconinternational.com/search?search={}"},
+    {"name":"MRPL","url":"https://www.mrpl.co.in/search?search={}"},
+    {"name":"CPCL","url":"https://www.cpcl.co.in/search?search={}"},
+    {"name":"BRPL","url":"https://www.brpl.in/search?search={}"},
+    {"name":"BYPL","url":"https://www.bypl.org/search?search={}"},
+    {"name":"TPDDL","url":"https://www.tpddl.com/search?search={}"},
+    {"name":"NDPL","url":"https://www.ndpl.com/search?search={}"},
+    {"name":"BSES","url":"https://www.bsesdelhi.com/search?search={}"},
+    {"name":"BEST","url":"https://www.bestundertaking.com/search?search={}"},
+    {"name":"TANGEDCO","url":"https://www.tangedco.gov.in/search?search={}"},
+    {"name":"TNEB","url":"https://www.tnebnet.org/search?search={}"},
+    {"name":"KSEBL","url":"https://www.kseb.in/search?search={}"},
+    {"name":"BESCOM","url":"https://www.bescom.org/search?search={}"},
+    {"name":"MESCOM","url":"https://www.mescom.karnataka.gov.in/search?search={}"},
+    {"name":"GESCOM","url":"https://www.gescom.in/search?search={}"},
+    {"name":"HESCOM","url":"https://www.hescom.co.in/search?search={}"},
+    {"name":"CESCOM","url":"https://www.cescmysore.org/search?search={}"},
+    {"name":"MPEZ","url":"https://www.mpez.co.in/search?search={}"},
+    {"name":"MPCZ","url":"https://www.mpcz.co.in/search?search={}"},
+    {"name":"JdVVNL","url":"https://www.jdvvnl.org/search?search={}"},
+    {"name":"JVVNL","url":"https://www.jvvnl.org/search?search={}"},
+    {"name":"AVVNL","url":"https://www.avvnl.org/search?search={}"},
+    {"name":"PUVNL","url":"https://www.puvnl.org/search?search={}"},
+    {"name":"KESCO","url":"https://www.kesco.co.in/search?search={}"},
+    {"name":"TorrentPower","url":"https://www.torrentpower.com/search?search={}"},
+    {"name":"AdaniElectricity","url":"https://www.adanielectricity.com/search?search={}"},
+    {"name":"TataPowerDDL","url":"https://www.tatapower-ddl.com/search?search={}"},
+    {"name":"TataPowerMumbai","url":"https://www.tatapower.com/mumbai/search?search={}"},
+    {"name":"TataPowerAjmer","url":"https://www.tatapowerajmer.com/search?search={}"},
+    {"name":"CESC","url":"https://www.cesc.co.in/search?search={}"},
+    {"name":"WBSEDCL","url":"https://www.wbsedcl.in/search?search={}"},
+    {"name":"DVC","url":"https://www.dvc.gov.in/search?search={}"},
+    {"name":"JUSCO","url":"https://www.juscoltd.com/search?search={}"},
+    {"name":"HVPNL","url":"https://www.hvpn.org/search?search={}"},
+    {"name":"UHBVN","url":"https://www.uhbvn.org.in/search?search={}"},
+    {"name":"DHBVN","url":"https://www.dhbvn.org.in/search?search={}"},
+    {"name":"PSPCL","url":"https://www.pspcl.in/search?search={}"},
+    {"name":"MSEDCL","url":"https://www.mahadiscom.in/search?search={}"},
+    {"name":"AdaniElectricityMumbai","url":"https://www.adanielectricity.com/mumbai/search?search={}"},
+    {"name":"TorrentPowerAhmedabad","url":"https://www.torrentpower.com/ahmedabad/search?search={}"},
+    {"name":"TorrentPowerSurat","url":"https://www.torrentpower.com/surat/search?search={}"},
+    {"name":"TorrentPowerDahej","url":"https://www.torrentpower.com/dahej/search?search={}"},
+    {"name":"TorrentPowerDholera","url":"https://www.torrentpower.com/dholera/search?search={}"},
+    {"name":"TorrentPowerShilaj","url":"https://www.torrentpower.com/shilaj/search?search={}"},
+    {"name":"TorrentPowerGandhinagar","url":"https://www.torrentpower.com/gandhinagar/search?search={}"},
+    {"name":"TorrentPowerMehsana","url":"https://www.torrentpower.com/mehsana/search?search={}"},
+    {"name":"TorrentPowerUna","url":"https://www.torrentpower.com/una/search?search={}"},
+    {"name":"TorrentPowerBhiwandi","url":"https://www.torrentpower.com/bhiwandi/search?search={}"},
+    {"name":"TorrentPowerAgra","url":"https://www.torrentpower.com/agra/search?search={}"},
+    {"name":"TorrentPowerBareilly","url":"https://www.torrentpower.com/bareilly/search?search={}"},
+    {"name":"TorrentPowerShahjahanpur","url":"https://www.torrentpower.com/shahjahanpur/search?search={}"},
+    {"name":"TorrentPowerKota","url":"https://www.torrentpower.com/kota/search?search={}"},
+    {"name":"TorrentPowerDili","url":"https://www.torrentpower.com/dili/search?search={}"},
+    {"name":"TorrentPowerSikar","url":"https://www.torrentpower.com/sikar/search?search={}"},
+    {"name":"TorrentPowerFatehpur","url":"https://www.torrentpower.com/fatehpur/search?search={}"},
+    {"name":"TorrentPowerLachhmangarh","url":"https://www.torrentpower.com/lachhmangarh/search?search={}"},
+    {"name":"TorrentPowerDantaramgarh","url":"https://www.torrentpower.com/dantaramgarh/search?search={}"},
+    {"name":"TorrentPowerKhandela","url":"https://www.torrentpower.com/khandela/search?search={}"},
+    {"name":"TorrentPowerPatan","url":"https://www.torrentpower.com/patan/search?search={}"},
+    {"name":"TorrentPowerAjitgarh","url":"https://www.torrentpower.com/ajitgarh/search?search={}"},
+    {"name":"TorrentPowerNeemrana","url":"https://www.torrentpower.com/neemrana/search?search={}"},
+    {"name":"TorrentPowerBehror","url":"https://www.torrentpower.com/behror/search?search={}"},
+    {"name":"TorrentPowerKotputli","url":"https://www.torrentpower.com/kotputli/search?search={}"},
+    {"name":"TorrentPowerViratnagar","url":"https://www.torrentpower.com/viratnagar/search?search={}"},
+    {"name":"TorrentPowerShahpura","url":"https://www.torrentpower.com/shahpura/search?search={}"},
+    {"name":"TorrentPowerBagru","url":"https://www.torrentpower.com/bagru/search?search={}"},
+    {"name":"TorrentPowerPhulera","url":"https://www.torrentpower.com/phulera/search?search={}"},
+    {"name":"TorrentPowerSambhar","url":"https://www.torrentpower.com/sambhar/search?search={}"},
+    {"name":"TorrentPowerMadhogarh","url":"https://www.torrentpower.com/madhogarh/search?search={}"},
+    {"name":"TorrentPowerMalpura","url":"https://www.torrentpower.com/malpura/search?search={}"},
+    {"name":"TorrentPowerNiwai","url":"https://www.torrentpower.com/niwai/search?search={}"},
+    {"name":"TorrentPowerTodaraisingh","url":"https://www.torrentpower.com/todaraisingh/search?search={}"},
+    {"name":"TorrentPowerUniara","url":"https://www.torrentpower.com/uniara/search?search={}"},
+    {"name":"TorrentPowerBundi","url":"https://www.torrentpower.com/bundi/search?search={}"},
+    {"name":"TorrentPowerBaran","url":"https://www.torrentpower.com/baran/search?search={}"},
+    {"name":"TorrentPowerJhalawar","url":"https://www.torrentpower.com/jhalawar/search?search={}"},
+    {"name":"TorrentPowerBhawaniMandi","url":"https://www.torrentpower.com/bhawanimandi/search?search={}"},
+    {"name":"TorrentPowerRamganjMandi","url":"https://www.torrentpower.com/ramganjmandi/search?search={}"},
+    {"name":"TorrentPowerSangod","url":"https://www.torrentpower.com/sangod/search?search={}"},
+    {"name":"TorrentPowerKumbhalgarh","url":"https://www.torrentpower.com/kumbhalgarh/search?search={}"},
+    {"name":"TorrentPowerNathdwara","url":"https://www.torrentpower.com/nathdwara/search?search={}"},
+    {"name":"TorrentPowerRajsamand","url":"https://www.torrentpower.com/rajsamand/search?search={}"},
+    {"name":"TorrentPowerAmet","url":"https://www.torrentpower.com/amet/search?search={}"},
+    {"name":"TorrentPowerDeogarh","url":"https://www.torrentpower.com/deogarh/search?search={}"},
+    {"name":"TorrentPowerBhim","url":"https://www.torrentpower.com/bhim/search?search={}"},
+    {"name":"TorrentPowerMandal","url":"https://www.torrentpower.com/mandal/search?search={}"},
+    {"name":"TorrentPowerFalna","url":"https://www.torrentpower.com/falna/search?search={}"},
+    {"name":"TorrentPowerSanderao","url":"https://www.torrentpower.com/sanderao/search?search={}"},
+    {"name":"TorrentPowerBali","url":"https://www.torrentpower.com/bali/search?search={}"},
+    {"name":"TorrentPowerSumerpur","url":"https://www.torrentpower.com/sumerpur/search?search={}"},
+    {"name":"TorrentPowerSheoganj","url":"https://www.torrentpower.com/sheoganj/search?search={}"},
+    {"name":"TorrentPowerTakhatgarh","url":"https://www.torrentpower.com/takhatgarh/search?search={}"},
+    {"name":"TorrentPowerSirohi","url":"https://www.torrentpower.com/sirohi/search?search={}"},
+    {"name":"TorrentPowerAbuRoad","url":"https://www.torrentpower.com/aburoad/search?search={}"},
+    {"name":"TorrentPowerPindwara","url":"https://www.torrentpower.com/pindwara/search?search={}"},
+    {"name":"TorrentPowerReodar","url":"https://www.torrentpower.com/reodar/search?search={}"},
+    {"name":"TorrentPowerNada","url":"https://www.torrentpower.com/nada/search?search={}"},
+    {"name":"TorrentPowerGogunda","url":"https://www.torrentpower.com/gogunda/search?search={}"},
+    {"name":"TorrentPowerJhadol","url":"https://www.torrentpower.com/jhadol/search?search={}"},
+    {"name":"TorrentPowerKotra","url":"https://www.torrentpower.com/kotra/search?search={}"},
+    {"name":"TorrentPowerSarada","url":"https://www.torrentpower.com/sarada/search?search={}"},
+    {"name":"TorrentPowerPhalasia","url":"https://www.torrentpower.com/phalasia/search?search={}"},
+    {"name":"TorrentPowerJhallara","url":"https://www.torrentpower.com/jhallara/search?search={}"},
+    {"name":"TorrentPowerDungla","url":"https://www.torrentpower.com/dungla/search?search={}"},
+    {"name":"TorrentPowerChhotiSarwan","url":"https://www.torrentpower.com/chhotisarwan/search?search={}"},
+    {"name":"TorrentPowerAspur","url":"https://www.torrentpower.com/aspur/search?search={}"},
+    {"name":"TorrentPowerSagwara","url":"https://www.torrentpower.com/sagwara/search?search={}"},
+    {"name":"TorrentPowerGaliakot","url":"https://www.torrentpower.com/galiakot/search?search={}"},
+    {"name":"TorrentPowerDungarpur","url":"https://www.torrentpower.com/dungarpur/search?search={}"},
+    {"name":"TorrentPowerBanswara","url":"https://www.torrentpower.com/banswara/search?search={}"},
+    {"name":"TorrentPowerKushalgarh","url":"https://www.torrentpower.com/kushalgarh/search?search={}"},
+    {"name":"TorrentPowerBagidora","url":"https://www.torrentpower.com/bagidora/search?search={}"},
+    {"name":"TorrentPowerGhatol","url":"https://www.torrentpower.com/ghatol/search?search={}"},
+    {"name":"TorrentPowerGarhi","url":"https://www.torrentpower.com/garhi/search?search={}"},
+    {"name":"TorrentPowerPartapur","url":"https://www.torrentpower.com/partapur/search?search={}"},
+    {"name":"TorrentPowerPiperan","url":"https://www.torrentpower.com/piperan/search?search={}"},
+    {"name":"TorrentPowerChhabra","url":"https://www.torrentpower.com/chhabra/search?search={}"},
+    {"name":"TorrentPowerAtru","url":"https://www.torrentpower.com/atru/search?search={}"},
+    {"name":"TorrentPowerMangrol","url":"https://www.torrentpower.com/mangrol/search?search={}"},
+    {"name":"TorrentPowerChhipabarod","url":"https://www.torrentpower.com/chhipabarod/search?search={}"},
+    {"name":"TorrentPowerKhanpur","url":"https://www.torrentpower.com/khanpur/search?search={}"},
+    {"name":"TorrentPowerAklera","url":"https://www.torrentpower.com/aklera/search?search={}"},
+    {"name":"TorrentPowerPachpahar","url":"https://www.torrentpower.com/pachpahar/search?search={}"},
+    {"name":"TorrentPowerManoharThana","url":"https://www.torrentpower.com/manoharthana/search?search={}"},
+    {"name":"TorrentPowerGangdhar","url":"https://www.torrentpower.com/gangdhar/search?search={}"},
+    {"name":"TorrentPowerPirawa","url":"https://www.torrentpower.com/pirawa/search?search={}"},
+    {"name":"TorrentPowerBakar","url":"https://www.torrentpower.com/bakar/search?search={}"},
+    {"name":"TorrentPowerThikariya","url":"https://www.torrentpower.com/thikariya/search?search={}"},
+    {"name":"TorrentPowerRatlam","url":"https://www.torrentpower.com/ratlam/search?search={}"},
+    {"name":"TorrentPowerJaora","url":"https://www.torrentpower.com/jaora/search?search={}"},
+    {"name":"TorrentPowerSailana","url":"https://www.torrentpower.com/sailana/search?search={}"},
+    {"name":"TorrentPowerAlot","url":"https://www.torrentpower.com/alot/search?search={}"},
+    {"name":"TorrentPowerTal","url":"https://www.torrentpower.com/tal/search?search={}"},
+    {"name":"TorrentPowerPiploda","url":"https://www.torrentpower.com/piploda/search?search={}"},
+    {"name":"TorrentPowerBadnawar","url":"https://www.torrentpower.com/badnawar/search?search={}"},
+    {"name":"TorrentPowerDhar","url":"https://www.torrentpower.com/dhar/search?search={}"},
+    {"name":"TorrentPowerKukshi","url":"https://www.torrentpower.com/kukshi/search?search={}"},
+    {"name":"TorrentPowerManawar","url":"https://www.torrentpower.com/manawar/search?search={}"},
+    {"name":"TorrentPowerGandhwani","url":"https://www.torrentpower.com/gandhwani/search?search={}"},
+    {"name":"TorrentPowerSardarpur","url":"https://www.torrentpower.com/sardarpur/search?search={}"},
+    {"name":"TorrentPowerPetlawad","url":"https://www.torrentpower.com/petlawad/search?search={}"},
+    {"name":"TorrentPowerJhabua","url":"https://www.torrentpower.com/jhabua/search?search={}"},
+    {"name":"TorrentPowerThandla","url":"https://www.torrentpower.com/thandla/search?search={}"},
+    {"name":"TorrentPowerMeghnagar","url":"https://www.torrentpower.com/meghnagar/search?search={}"},
+    {"name":"TorrentPowerAlirajpur","url":"https://www.torrentpower.com/alirajpur/search?search={}"},
+    {"name":"TorrentPowerJobat","url":"https://www.torrentpower.com/jobat/search?search={}"},
+    {"name":"TorrentPowerSendhwa","url":"https://www.torrentpower.com/sendhwa/search?search={}"},
+    {"name":"TorrentPowerBarwani","url":"https://www.torrentpower.com/barwani/search?search={}"},
+    {"name":"TorrentPowerRajpur","url":"https://www.torrentpower.com/rajpur/search?search={}"},
+    {"name":"TorrentPowerPansemal","url":"https://www.torrentpower.com/pansemal/search?search={}"},
+    {"name":"TorrentPowerNiwali","url":"https://www.torrentpower.com/niwali/search?search={}"},
+    {"name":"TorrentPowerBhikangaon","url":"https://www.torrentpower.com/bhikangaon/search?search={}"},
+    {"name":"TorrentPowerKasrawad","url":"https://www.torrentpower.com/kasrawad/search?search={}"},
+    {"name":"TorrentPowerMaheshwar","url":"https://www.torrentpower.com/maheshwar/search?search={}"},
+    {"name":"TorrentPowerMandleshwar","url":"https://www.torrentpower.com/mandleshwar/search?search={}"},
+    {"name":"TorrentPowerKhargone","url":"https://www.torrentpower.com/khargone/search?search={}"},
+    {"name":"TorrentPowerSanawad","url":"https://www.torrentpower.com/sanawad/search?search={}"},
+    {"name":"TorrentPowerBarwaha","url":"https://www.torrentpower.com/barwaha/search?search={}"},
+    {"name":"TorrentPowerKhandwa","url":"https://www.torrentpower.com/khandwa/search?search={}"},
+    {"name":"TorrentPowerPandhana","url":"https://www.torrentpower.com/pandhana/search?search={}"},
+    {"name":"TorrentPowerHarsud","url":"https://www.torrentpower.com/harsud/search?search={}"},
+    {"name":"TorrentPowerKhalwa","url":"https://www.torrentpower.com/khalwa/search?search={}"},
+    {"name":"TorrentPowerPunasa","url":"https://www.torrentpower.com/punasa/search?search={}"},
+    {"name":"TorrentPowerBurhanpur","url":"https://www.torrentpower.com/burhanpur/search?search={}"},
+    {"name":"TorrentPowerNepanagar","url":"https://www.torrentpower.com/nepanagar/search?search={}"},
+    {"name":"TorrentPowerKhaknar","url":"https://www.torrentpower.com/khaknar/search?search={}"},
+    {"name":"TorrentPowerShahpur","url":"https://www.torrentpower.com/shahpur/search?search={}"},
+    {"name":"TorrentPowerChhanera","url":"https://www.torrentpower.com/chhanera/search?search={}"},
+]
 
 # =============================================================================
-# ASYNC INFRASTRUKTUR (Korrigiert fuer Streamlit)
+# KLASSEN v8.0
 # =============================================================================
 
 class AsyncRunner:
-    """Singleton-Manager fuer korrekte Async-Execution in Streamlit."""
+    """Singleton für korrektes Event-Loop-Management in Streamlit."""
     _instance = None
-    _loop = None
-
+    _lock = threading.Lock()
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._loop = None
         return cls._instance
-
     def get_loop(self):
-        """Gibt einen funktionierenden Event Loop zurueck."""
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_closed():
-                raise RuntimeError("Loop closed")
-            return loop
-        except RuntimeError:
-            if self._loop is None or self._loop.is_closed():
+        if self._loop is None or self._loop.is_closed():
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
-            return self._loop
-
-    def run(self, coro):
-        """Fuehrt eine Coroutine sicher in Streamlit aus."""
+        return self._loop
+    def run_async(self, coro):
         loop = self.get_loop()
         if loop.is_running():
-            # Wir sind in einem laufenden Loop (z.B. Streamlits interner Loop)
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result(timeout=300)
+                return pool.submit(lambda: asyncio.run(coro)).result()
         return loop.run_until_complete(coro)
 
-    def close(self):
-        if self._loop and not self._loop.is_closed():
-            self._loop.close()
-            self._loop = None
-
-async_runner = AsyncRunner()
-
-@asynccontextmanager
-async def managed_session():
-    """Context-Manager fuer aiohttp Sessions mit garantiertem Cleanup."""
-    connector = aiohttp.TCPConnector(
-        limit=50, 
-        limit_per_host=10, 
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        force_close=True,
-        enable_cleanup_closed=True
-    )
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-    session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-    try:
-        yield session
-    finally:
-        await session.close()
-        await connector.close()
-
-# =============================================================================
-# RATE LIMITER (Per-Domain, Thread-Safe)
-# =============================================================================
-
 class AdaptiveRateLimiter:
-    """Per-Domain Rate Limiter mit Token Bucket und Backoff."""
-    def __init__(self, default_rate: float = 2.0, burst: int = 3):
-        self.default_rate = default_rate
-        self.burst = burst
-        self._tokens: Dict[str, float] = defaultdict(lambda: float(burst))
-        self._last_update: Dict[str, float] = defaultdict(time.time)
-        self._backoff_until: Dict[str, float] = defaultdict(float)
-        self._lock = asyncio.Lock()
-
-    async def acquire(self, domain: str, cost: float = 1.0):
-        async with self._lock:
+    """Per-Domain Token Bucket mit Backoff."""
+    def __init__(self):
+        self.buckets = {}
+        self.locks = defaultdict(threading.Lock)
+    def _get_bucket(self, domain):
+        if domain not in self.buckets:
+            rate, per = CONFIG["rate_limits"].get(domain, CONFIG["rate_limits"]["default"])
+            self.buckets[domain] = {"tokens": rate, "last": time.time(), "rate": rate, "per": per}
+        return self.buckets[domain]
+    async def acquire(self, domain):
+        bucket = self._get_bucket(domain)
+        with self.locks[domain]:
             now = time.time()
-            # Backoff-Check
-            if now < self._backoff_until[domain]:
-                wait = self._backoff_until[domain] - now
+            elapsed = now - bucket["last"]
+            bucket["tokens"] = min(bucket["rate"], bucket["tokens"] + elapsed * bucket["rate"] / bucket["per"])
+            bucket["last"] = now
+            if bucket["tokens"] < 1:
+                wait = (1 - bucket["tokens"]) * bucket["per"] / bucket["rate"]
                 await asyncio.sleep(wait)
-                now = time.time()
-
-            elapsed = now - self._last_update[domain]
-            self._tokens[domain] = min(
-                self.burst, 
-                self._tokens[domain] + elapsed * self.default_rate
-            )
-            self._last_update[domain] = now
-
-            if self._tokens[domain] < cost:
-                wait_time = (cost - self._tokens[domain]) / self.default_rate
-                await asyncio.sleep(wait_time)
-                self._tokens[domain] = 0
+                bucket["tokens"] = 0
             else:
-                self._tokens[domain] -= cost
-
-    def report_error(self, domain: str, backoff_seconds: float = 60):
-        """Erhoeht Backoff bei Fehlern (z.B. 429, 503)."""
-        self._backoff_until[domain] = time.time() + backoff_seconds
-        logger.warning(f"Rate-Limiter Backoff fuer {domain}: {backoff_seconds}s")
-
-rate_limiter = AdaptiveRateLimiter(RATE_LIMIT_PER_DOMAIN)
-
-# =============================================================================
-# CIRCUIT BREAKER (Mit Logging)
-# =============================================================================
-
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 300):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failures: Dict[str, int] = defaultdict(int)
-        self.last_failure: Dict[str, datetime] = {}
-        self.state: Dict[str, str] = defaultdict(lambda: "closed")
-        self._lock = asyncio.Lock()
-
-    async def call(self, platform: str, func, *args, **kwargs):
-        async with self._lock:
-            if self.state[platform] == "open":
-                last_fail = self.last_failure.get(platform, datetime.min)
-                if datetime.now() - last_fail > timedelta(seconds=self.recovery_timeout):
-                    self.state[platform] = "half-open"
-                    logger.info(f"CircuitBreaker: {platform} -> half-open")
-                else:
-                    remaining = self.recovery_timeout - (datetime.now() - last_fail).seconds
-                    logger.debug(f"CircuitBreaker: {platform} OPEN ({remaining}s remaining)")
-                    return []
-
-        try:
-            if asyncio.iscoroutinefunction(func):
-                result = await func(*args, **kwargs)
-            else:
-                result = await asyncio.to_thread(func, *args, **kwargs)
-
-            async with self._lock:
-                if self.state[platform] == "half-open":
-                    self.state[platform] = "closed"
-                    self.failures[platform] = 0
-                    logger.info(f"CircuitBreaker: {platform} -> closed (recovered)")
-            return result
-
-        except Exception as e:
-            async with self._lock:
-                self.failures[platform] += 1
-                self.last_failure[platform] = datetime.now()
-                if self.failures[platform] >= self.failure_threshold:
-                    self.state[platform] = "open"
-                    logger.error(f"CircuitBreaker: {platform} -> OPEN nach {self.failures[platform]} Fehlern: {e}")
-                else:
-                    logger.warning(f"CircuitBreaker: {platform} Fehler {self.failures[platform]}/{self.failure_threshold}: {e}")
-            raise
-
-circuit_breaker = CircuitBreaker()
-
-
-# =============================================================================
-# UTILITIES & SECURITY
-# =============================================================================
-
-def sanitize_input(text: str) -> str:
-    """Entfernt potenziell gefaehrliche Zeichen aus User-Input."""
-    if not text:
-        return ""
-    # Erlaubt nur Buchstaben, Zahlen, Leerzeichen, Bindestriche
-    cleaned = re.sub(r'[^\w\s\-\.]', '', text)
-    return cleaned.strip()[:100]  # Max 100 Zeichen
-
-def validate_url(url: str) -> bool:
-    """Validiert ob eine URL sicher ist (kein file://, javascript: etc)."""
-    if not url:
-        return False
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
-            return False
-        if not parsed.netloc:
-            return False
-        return True
-    except Exception:
-        return False
-
-def escape_html(text: str) -> str:
-    """XSS-Schutz: Escaped HTML-Sonderzeichen."""
-    if not text:
-        return ""
-    return html.escape(str(text))
-
-# =============================================================================
-# BIOMETRIE-ENGINE v2.0 (Echt Biometrisch)
-# =============================================================================
+                bucket["tokens"] -= 1
 
 class BiometricAnalyzer:
-    """OpenCV-basierte Gesichtserkennung ohne TensorFlow/DeepFace.
-
-    Verbesserungen gegenueber v5.1:
-    - Face-ROI Extraktion (nur Gesichtsbereich wird analysiert)
-    - LBP (Local Binary Patterns) fuer beleuchtungsunabhaengige Features
-    - HOG-Deskriptoren als sekundaere Feature-Quelle
-    - Face-Alignment basierend auf Augen-Positionen
-    - Multi-Scale Face Detection
-    """
-
+    """DNN Face Detection + Multi-Feature Embeddings (LBP + HOG + LAB + Gabor)."""
     def __init__(self):
-        self.face_cascade = None
-        self.eye_cascade = None
         self.dnn_net = None
-        self.lbp_params = {
-            'radius': 1,
-            'n_points': 8,
-            'grid_x': 7,
-            'grid_y': 7
-        }
-        if HAS_CV2:
-            self._load_classifiers()
-
-    def _load_classifiers(self):
-        """Laedt Haar-Cascades und DNN-Modelle."""
+        self._ensure_dnn()
+    def _ensure_dnn(self):
+        if self.dnn_net is not None:
+            return
+        proto_path = "deploy.prototxt"
+        model_path = "res10_300x300_ssd_iter_140000.caffemodel"
+        if not os.path.exists(proto_path):
+            import urllib.request
+            try:
+                urllib.request.urlretrieve(CONFIG["dnn_proto_url"], proto_path)
+                urllib.request.urlretrieve(CONFIG["dnn_model_url"], model_path)
+            except Exception as e:
+                st.warning(f"DNN Model Download fehlgeschlagen: {e}")
+                return
         try:
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.exists(cascade_path):
-                self.face_cascade = cv2.CascadeClassifier(cascade_path)
-                logger.info("Haar Face Cascade geladen")
+            self.dnn_net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
         except Exception as e:
-            logger.error(f"Face Cascade Fehler: {e}")
-
-        try:
-            eye_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
-            if os.path.exists(eye_path):
-                self.eye_cascade = cv2.CascadeClassifier(eye_path)
-        except Exception:
-            pass
-
-        try:
-            prototxt = os.path.expanduser("~/.opencv/face_detector/deploy.prototxt")
-            model = os.path.expanduser("~/.opencv/face_detector/res10_300x300_ssd_iter_140000.caffemodel")
-            if os.path.exists(prototxt) and os.path.exists(model):
-                self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
-                logger.info("DNN Face Detector geladen")
-        except Exception:
-            pass
-
-    def detect_face(self, img_path: str) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
-        """Erkennt Gesicht und gibt (erfolg, bbox) zurueck."""
-        if not HAS_CV2 or self.face_cascade is None:
-            return False, None
-        try:
-            img = cv2.imread(img_path)
-            if img is None:
-                return False, None
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=4, minSize=(64, 64)
-            )
-            if len(faces) > 0:
-                # Groesstes Gesicht waehlen
-                largest = max(faces, key=lambda f: f[2] * f[3])
-                return True, tuple(largest)
-            return False, None
-        except Exception as e:
-            logger.warning(f"Face Detection Fehler: {e}")
-            return False, None
-
-    def _align_face(self, img: np.ndarray, face_rect: Tuple[int, int, int, int]) -> np.ndarray:
-        """Rotiert Gesicht basierend auf Augen-Positionen."""
-        if self.eye_cascade is None:
-            return img
-        try:
-            x, y, w, h = face_rect
-            roi_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[y:y+h, x:x+w]
-            eyes = self.eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
-            if len(eyes) >= 2:
-                eyes = sorted(eyes, key=lambda e: e[0])
-                left_eye = (eyes[0][0] + eyes[0][2]//2, eyes[0][1] + eyes[0][3]//2)
-                right_eye = (eyes[1][0] + eyes[1][2]//2, eyes[1][1] + eyes[1][3]//2)
-                dy = right_eye[1] - left_eye[1]
-                dx = right_eye[0] - left_eye[0]
-                angle = np.degrees(np.arctan2(dy, dx))
-                center = (x + w//2, y + h//2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                aligned = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
-                                        flags=cv2.INTER_CUBIC,
-                                        borderMode=cv2.BORDER_CONSTANT,
-                                        borderValue=(128, 128, 128))
-                return aligned
-        except Exception:
-            pass
-        return img
-
-    def _extract_lbp(self, gray_roi: np.ndarray) -> np.ndarray:
-        """Extrahiert Local Binary Patterns aus Grayscale-ROI."""
-        try:
-            radius = self.lbp_params['radius']
-            n_points = self.lbp_params['n_points']
-            grid_x = self.lbp_params['grid_x']
-            grid_y = self.lbp_params['grid_y']
-
-            h, w = gray_roi.shape
-            cell_h = max(1, h // grid_y)
-            cell_w = max(1, w // grid_x)
-
-            lbp_features = []
-            for i in range(grid_y):
-                for j in range(grid_x):
-                    y_start = i * cell_h
-                    y_end = min((i + 1) * cell_h, h)
-                    x_start = j * cell_w
-                    x_end = min((j + 1) * cell_w, w)
-                    cell = gray_roi[y_start:y_end, x_start:x_end]
-
-                    # LBP berechnen
-                    lbp = np.zeros_like(cell)
-                    for dy in range(-radius, radius + 1):
-                        for dx in range(-radius, radius + 1):
-                            if dx == 0 and dy == 0:
-                                continue
-                            shifted = np.roll(np.roll(cell, dy, axis=0), dx, axis=1)
-                            lbp += (shifted >= cell).astype(np.uint8)
-
-                    # Histogramm des LBP
-                    hist, _ = np.histogram(lbp.ravel(), bins=256, range=(0, 256))
-                    hist = hist.astype(np.float32)
-                    norm = np.linalg.norm(hist) + 1e-10
-                    hist = hist / norm
-                    lbp_features.extend(hist.tolist())
-
-            return np.array(lbp_features, dtype=np.float32)
-        except Exception as e:
-            logger.warning(f"LBP Extraktion fehlgeschlagen: {e}")
-            return np.array([], dtype=np.float32)
-
-    def _extract_color_features(self, face_roi: np.ndarray) -> np.ndarray:
-        """Extrahiert robuste Farb-Features aus dem Gesicht."""
-        try:
-            # Konvertiere zu LAB (perzeptuell uniform)
-            lab = cv2.cvtColor(face_roi, cv2.COLOR_BGR2LAB)
-            features = []
-            for i in range(3):
-                channel = lab[:, :, i]
-                # Statistische Momente
-                mean = np.mean(channel)
-                std = np.std(channel)
-                skew = np.mean(((channel - mean) / (std + 1e-10)) ** 3)
-                # Histogramm
-                hist = cv2.calcHist([channel], [0], None, [16], [0, 256]).flatten()
-                hist = cv2.normalize(hist, hist).flatten()
-                features.extend([mean / 255.0, std / 255.0, skew])
-                features.extend(hist.tolist())
-            return np.array(features, dtype=np.float32)
-        except Exception:
-            return np.array([], dtype=np.float32)
-
-    def _extract_hog_features(self, gray_roi: np.ndarray) -> np.ndarray:
-        """Extrahiert HOG-ähnliche Features (Gradienten-Orientierungen)."""
-        try:
-            # Berechne Gradienten
-            gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
-            mag, ang = cv2.cartToPolar(gx, gy)
-
-            # Quantisiere Orientierungen in 9 Bins
-            bins = np.int32(ang * (9 / (2 * np.pi)))
-            bins = np.mod(bins, 9)
-
-            # Cell-Histogramme (8x8 Grid)
-            cell_size = max(8, min(gray_roi.shape) // 8)
-            h, w = gray_roi.shape
-            features = []
-            for y in range(0, h - cell_size + 1, cell_size):
-                for x in range(0, w - cell_size + 1, cell_size):
-                    cell_mag = mag[y:y+cell_size, x:x+cell_size]
-                    cell_bins = bins[y:y+cell_size, x:x+cell_size]
-                    hist = np.zeros(9, dtype=np.float32)
-                    for b in range(9):
-                        hist[b] = np.sum(cell_mag[cell_bins == b])
-                    norm = np.linalg.norm(hist) + 1e-10
-                    features.extend((hist / norm).tolist())
-            return np.array(features, dtype=np.float32)
-        except Exception:
-            return np.array([], dtype=np.float32)
-
-    def extract_embedding(self, img_path: str) -> Optional[np.ndarray]:
-        """Erstellt ein robustes 512-D Gesichts-Embedding."""
-        if not HAS_CV2:
-            return None
-        try:
-            img = cv2.imread(img_path)
-            if img is None:
-                return None
-
-            # Gesicht erkennen
-            detected, face_rect = self.detect_face(img_path)
-            if detected and face_rect is not None:
-                # Alignment
-                aligned = self._align_face(img, face_rect)
-                x, y, w, h = face_rect
-                # Margin hinzufuegen (20%)
-                margin = int(0.2 * max(w, h))
-                x1 = max(0, x - margin)
-                y1 = max(0, y - margin)
-                x2 = min(img.shape[1], x + w + margin)
-                y2 = min(img.shape[0], y + h + margin)
-                face_roi = aligned[y1:y2, x1:x2]
-            else:
-                # Fallback: Gesamtes Bild (zentriertes Crop)
-                h, w = img.shape[:2]
-                size = min(h, w)
-                y_start = (h - size) // 2
-                x_start = (w - size) // 2
-                face_roi = img[y_start:y_start+size, x_start:x_start+size]
-
-            if face_roi.size == 0:
-                return None
-
-            # Standardisieren auf 128x128
-            face_roi = cv2.resize(face_roi, (128, 128), interpolation=cv2.INTER_AREA)
-            gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-
-            # Multi-Feature Extraktion
-            lbp = self._extract_lbp(gray_roi)
-            color = self._extract_color_features(face_roi)
-            hog = self._extract_hog_features(gray_roi)
-
-            # Kombiniere Features
-            combined = np.concatenate([lbp, color, hog])
-
-            # Auf 512 Dimensionen normalisieren (PCA-ähnlich durch gleichmaessige Sampling)
-            if len(combined) >= EMBEDDING_DIM:
-                # Gleichmaessige Samples
-                indices = np.linspace(0, len(combined) - 1, EMBEDDING_DIM).astype(int)
-                embedding = combined[indices]
-            else:
-                # Padding mit Nullen (sollte nicht passieren)
-                embedding = np.zeros(EMBEDDING_DIM, dtype=np.float32)
-                embedding[:len(combined)] = combined
-
-            # L2-Normalisierung
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-
-            return embedding.astype(np.float32)
-
-        except Exception as e:
-            logger.error(f"Embedding Extraktion fehlgeschlagen: {e}")
-            return None
-
-    def extract_from_bytes(self, img_bytes: bytes) -> Optional[np.ndarray]:
-        """Extrahiert Embedding aus Bild-Bytes."""
-        if not HAS_CV2 or not img_bytes:
-            return None
-        try:
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return None
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                cv2.imwrite(tmp.name, img)
-                emb = self.extract_embedding(tmp.name)
-                os.unlink(tmp.name)
-                return emb
-        except Exception as e:
-            logger.warning(f"Bytes-Extraktion fehlgeschlagen: {e}")
-            return None
-
-    def compare_embeddings(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
-        """Cosinus-Similaritaet zwischen zwei Embeddings."""
-        if emb1 is None or emb2 is None:
-            return 0.0
-        try:
-            n1 = np.linalg.norm(emb1)
-            n2 = np.linalg.norm(emb2)
-            if n1 == 0 or n2 == 0:
-                return 0.0
-            return float(np.dot(emb1, emb2) / (n1 * n2))
-        except Exception:
-            return 0.0
-
-    async def batch_extract(self, img_bytes_list: List[bytes]) -> List[Optional[np.ndarray]]:
-        """Batch-Extraktion mit Thread-Offloading."""
-        if not HAS_CV2:
-            return [None] * len(img_bytes_list)
-
-        results = []
-        # Verarbeite in kleinen Batches um Memory-Pressure zu vermeiden
-        batch_size = 4
-        for i in range(0, len(img_bytes_list), batch_size):
-            batch = img_bytes_list[i:i+batch_size]
-            tasks = [asyncio.to_thread(self.extract_from_bytes, b) for b in batch]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in batch_results:
-                if isinstance(res, Exception):
-                    logger.warning(f"Batch-Extraktion Fehler: {res}")
-                    results.append(None)
-                else:
-                    results.append(res)
-        return results
-
-bio_analyzer = BiometricAnalyzer() if HAS_CV2 else None
-HAS_BIOMETRIE = HAS_CV2
-
-
-# =============================================================================
-# DATENBANK & VECTOR STORE (Mit TTL und Connection-Pooling)
-# =============================================================================
+            st.warning(f"DNN Init fehlgeschlagen: {e}")
+    def detect_faces(self, image: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
+        if self.dnn_net is None:
+            return []
+        h, w = image.shape[:2]
+        blob = cv2.dnn.blobFromImage(cv2.resize(image, CONFIG["face_input_size"]), 1.0, CONFIG["face_input_size"], (104.0, 177.0, 123.0))
+        self.dnn_net.setInput(blob)
+        detections = self.dnn_net.forward()
+        faces = []
+        for i in range(detections.shape[2]):
+            conf = detections[0,0,i,2]
+            if conf > CONFIG["face_conf_threshold"]:
+                x1, y1, x2, y2 = int(detections[0,0,i,3]*w), int(detections[0,0,i,4]*h), int(detections[0,0,i,5]*w), int(detections[0,0,i,6]*h)
+                faces.append((max(0,x1), max(0,y1), min(w,x2), min(h,y2), conf))
+        return faces
+    def align_face(self, face_img: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml").detectMultiScale(gray, 1.1, 3, minSize=(20,20))
+        if len(eyes) >= 2:
+            eyes = sorted(eyes, key=lambda e: e[0])[:2]
+            eye_centers = [(e[0]+e[2]//2, e[1]+e[3]//2) for e in eyes]
+            dy = eye_centers[1][1] - eye_centers[0][1]
+            dx = eye_centers[1][0] - eye_centers[0][0]
+            angle = math.degrees(math.atan2(dy, dx))
+            center = ((eye_centers[0][0]+eye_centers[1][0])//2, (eye_centers[0][1]+eye_centers[1][1])//2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            return cv2.warpAffine(face_img, M, (face_img.shape[1], face_img.shape[0]))
+        return face_img
+    def extract_embedding(self, face_img: np.ndarray) -> np.ndarray:
+        aligned = self.align_face(face_img)
+        resized = cv2.resize(aligned, CONFIG["align_size"])
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        features = []
+        # LBP
+        if SKIMAGE:
+            lbp = local_binary_pattern(gray, CONFIG["lbp_n_points"], CONFIG["lbp_radius"], method="uniform")
+            features.extend(np.histogram(lbp, bins=59, range=(0,59))[0])
+        else:
+            features.extend([0]*59)
+        # HOG
+        if SKIMAGE:
+            hog_feat = hog(gray, orientations=CONFIG["hog_orientations"], pixels_per_cell=CONFIG["hog_pixels_cell"], cells_per_block=CONFIG["hog_cells_block"], feature_vector=True)
+            features.extend(hog_feat)
+        else:
+            features.extend([0]*324)
+        # LAB Color Histogram
+        lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+        for i in range(3):
+            features.extend(cv2.calcHist([lab],[i],None,[32],[0,256]).flatten())
+        # Gabor
+        if SKIMAGE:
+            for freq in CONFIG["gabor_frequencies"]:
+                for theta in CONFIG["gabor_thetas"]:
+                    filt_real, _ = gabor(gray, frequency=freq, theta=theta)
+                    features.extend([filt_real.mean(), filt_real.std()])
+        else:
+            features.extend([0]*24)
+        emb = np.array(features, dtype=np.float32)
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else emb
+    def compute_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
+        return float(np.dot(emb1, emb2))
 
 class VectorDatabase:
-    """FAISS/SQLite Hybrid mit TTL-Caching und sauberem Connection-Management."""
-
-    def __init__(self, db_path: Path, dim: int = 512):
+    """FAISS/SQLite Hybrid mit TTL-Caching."""
+    def __init__(self, db_path: str = "facesearch_cache.db"):
         self.db_path = db_path
-        self.dim = dim
-        self.index = None
-        self.urls: List[str] = []
-        self.metadata: Dict[str, dict] = {}
-        self._fallback_embeddings: Dict[str, np.ndarray] = {}
         self._init_db()
-
-    @contextmanager
-    def _get_conn(self):
-        """Context-Manager fuer SQLite Connections."""
-        conn = None
-        try:
-            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            yield conn
-        finally:
-            if conn:
-                conn.close()
-
-    def _init_db(self):
-        """Initialisiert Schema mit TTL-Support."""
-        try:
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS embeddings_meta (
-                        url TEXT PRIMARY KEY,
-                        source TEXT,
-                        platform TEXT,
-                        face_detected INTEGER,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        access_count INTEGER DEFAULT 0
-                    )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS search_cache (
-                        query_hash TEXT PRIMARY KEY,
-                        results_json TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        hit_count INTEGER DEFAULT 0
-                    )
-                """)
-                c.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_cache_created 
-                    ON search_cache(created_at)
-                """)
-                conn.commit()
-                logger.info("Datenbank initialisiert")
-        except Exception as e:
-            logger.error(f"DB Initialisierungsfehler: {e}")
-
-        if HAS_FAISS:
+        self.faiss_index = None
+        if FAISS:
             try:
-                self.index = faiss.IndexFlatIP(self.dim)
-                logger.info("FAISS Index erstellt")
-            except Exception as e:
-                logger.error(f"FAISS Index-Fehler: {e}")
-                self.index = None
-
-    def _cleanup_expired_cache(self):
-        """Entfernt abgelaufene Cache-Eintraege."""
-        try:
-            cutoff = datetime.now() - timedelta(hours=CACHE_TTL_HOURS)
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("DELETE FROM search_cache WHERE created_at < ?", (cutoff,))
-                deleted = c.rowcount
-                conn.commit()
-                if deleted > 0:
-                    logger.info(f"Cache bereinigt: {deleted} alte Eintraege entfernt")
-        except Exception as e:
-            logger.warning(f"Cache-Cleanup Fehler: {e}")
-
-    def save_embedding(self, url: str, source: str, platform: str, 
-                      embedding: np.ndarray, face_detected: bool):
-        """Speichert Embedding in FAISS und SQLite."""
-        if embedding is None or not validate_url(url):
-            return
-
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        if HAS_FAISS and self.index is not None:
-            try:
-                emb_array = embedding.astype(np.float32).reshape(1, -1)
-                self.index.add(emb_array)
-                self.urls.append(url)
-            except Exception as e:
-                logger.warning(f"FAISS add Fehler: {e}")
-        else:
-            self._fallback_embeddings[url] = embedding
-
-        try:
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("""
-                    INSERT OR REPLACE INTO embeddings_meta 
-                    (url, source, platform, face_detected, created_at, access_count)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 
-                        COALESCE((SELECT access_count FROM embeddings_meta WHERE url = ?), 0) + 1)
-                """, (url, source, platform, 1 if face_detected else 0, url))
-                conn.commit()
-                self.metadata[url] = {
-                    "source": source, 
-                    "platform": platform, 
-                    "face_detected": face_detected
-                }
-        except Exception as e:
-            logger.warning(f"Meta-Speicherung Fehler: {e}")
-
-    def find_similar(self, ref_embedding: np.ndarray, top_k: int = 20, 
-                    threshold: float = 0.6) -> List[Tuple[str, float]]:
-        """Findet aehnliche Embeddings."""
-        if ref_embedding is None:
-            return []
-
-        norm = np.linalg.norm(ref_embedding)
-        if norm > 0:
-            ref_embedding = ref_embedding / norm
-
-        results = []
-
-        if HAS_FAISS and self.index is not None and self.index.ntotal > 0:
-            try:
-                query = ref_embedding.astype(np.float32).reshape(1, -1)
-                k = min(top_k, self.index.ntotal)
-                distances, indices = self.index.search(query, k)
-                for i, dist in zip(indices[0], distances[0]):
-                    if i < len(self.urls) and dist >= threshold:
-                        results.append((self.urls[i], float(dist)))
-            except Exception as e:
-                logger.warning(f"FAISS Suche Fehler: {e}")
-
-        # Fallback
-        if not results:
-            for url, emb in self._fallback_embeddings.items():
-                sim = float(np.dot(ref_embedding, emb))
-                if sim >= threshold:
-                    results.append((url, sim))
-            results.sort(key=lambda x: x[1], reverse=True)
-
-        return results[:top_k]
-
-    def get_stats(self) -> dict:
-        """Gibt Datenbank-Statistiken zurueck."""
-        faiss_count = self.index.ntotal if (HAS_FAISS and self.index) else 0
-        fallback_count = len(self._fallback_embeddings)
-        return {
-            "total_vectors": faiss_count + fallback_count,
-            "faiss_vectors": faiss_count,
-            "fallback_vectors": fallback_count,
-            "backend": "FAISS" if HAS_FAISS else "Fallback",
-            "dim": self.dim
-        }
-
-    def save_search_cache(self, query_hash: str, results: List[Any]):
-        """Speichert Suchergebnisse mit TTL."""
-        serializable = []
-        for r in results:
-            d = {
-                'title': r.title, 'url': r.url, 'snippet': r.snippet,
-                'source': r.source, 'platform': r.platform,
-                'thumbnail_url': r.thumbnail_url,
-                'match_score': r.match_score,
-                'face_similarity': r.face_similarity,
-                'face_detected': r.face_detected,
-                'found_via': r.found_via
-            }
-            serializable.append(d)
-
-        try:
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("""
-                    INSERT OR REPLACE INTO search_cache 
-                    (query_hash, results_json, created_at, hit_count)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, 
-                        COALESCE((SELECT hit_count FROM search_cache WHERE query_hash = ?), 0))
-                """, (query_hash, json.dumps(serializable), query_hash))
-                conn.commit()
-        except Exception as e:
-            logger.warning(f"Cache-Speicherung Fehler: {e}")
-
-    def get_search_cache(self, query_hash: str) -> Optional[List[dict]]:
-        """Holt gecachte Ergebnisse wenn nicht abgelaufen."""
-        try:
-            cutoff = datetime.now() - timedelta(hours=CACHE_TTL_HOURS)
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("""
-                    SELECT results_json, created_at 
-                    FROM search_cache 
-                    WHERE query_hash = ? AND created_at > ?
-                """, (query_hash, cutoff))
-                row = c.fetchone()
-                if row:
-                    # Hit-Count erhoehen
-                    c.execute("""
-                        UPDATE search_cache 
-                        SET hit_count = hit_count + 1 
-                        WHERE query_hash = ?
-                    """, (query_hash,))
-                    conn.commit()
-                    return json.loads(row[0])
-        except Exception as e:
-            logger.warning(f"Cache-Lesen Fehler: {e}")
-        return None
-
-    def clear(self):
-        """Leert alle Daten."""
-        try:
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
-            self.index = None
-            self.urls = []
-            self.metadata = {}
-            self._fallback_embeddings = {}
-            self._init_db()
-            logger.info("Datenbank vollstaendig geleert")
-        except Exception as e:
-            logger.error(f"Datenbank-Reset Fehler: {e}")
-
-vector_db = VectorDatabase(DB_PATH, EMBEDDING_DIM)
-
-# =============================================================================
-# DATENMODELL
-# =============================================================================
-
-class ErrorCategory(Enum):
-    NETWORK = "network"
-    API_RATE_LIMIT = "rate_limit"
-    API_AUTH = "auth"
-    BIOMETRIC = "biometric"
-    DATABASE = "database"
-    PARSING = "parsing"
-    PROXY = "proxy"
-
-@dataclass
-class SearchResult:
-    title: str
-    url: str
-    snippet: str
-    source: str
-    thumbnail_url: Optional[str] = None
-    match_score: Optional[float] = None
-    platform: str = ""
-    is_match: Optional[bool] = None
-    face_similarity: Optional[float] = None
-    face_detected: bool = False
-    found_via: str = "api"
-
-    def __post_init__(self):
-        """Validierung nach Initialisierung."""
-        self.title = escape_html(self.title[:200])
-        self.snippet = escape_html(self.snippet[:500])
-        self.url = str(self.url)[:500]
-        if self.thumbnail_url and not validate_url(self.thumbnail_url):
-            self.thumbnail_url = None
-
-    def to_dict(self) -> dict:
-        return {
-            'Titel': self.title,
-            'URL': self.url,
-            'Quelle': self.source,
-            'Plattform': self.platform,
-            'Text-Score (%)': self.match_score if self.match_score else '-',
-            'Bio-Score (%)': round(self.face_similarity * 100, 1) if self.face_similarity else '-',
-            'Gesicht erkannt': 'Ja' if self.face_detected else 'Nein',
-            'Gefunden via': self.found_via,
-            'Treffer': 'Ja' if self.is_match is True else ('Nein' if self.is_match is False else 'Unbewertet')
-        }
-
-@dataclass
-class SearchQuery:
-    image_path: Optional[str] = None
-    person_name: Optional[str] = None
-    engines: List[str] = field(default_factory=list)
-    max_results: int = 20
-
-
-# =============================================================================
-# NETZWERK-UTILITIES (Mit Retry und besserem Error-Handling)
-# =============================================================================
-
-class ConnectionManager:
-    """Verbesserter Connection Manager mit Proxy-Rotation und Header-Management."""
-
-    def __init__(self):
-        self.ua = UserAgent() if HAS_FAKE_UA else None
-        self.proxy_pool = PROXY_POOL
-        self.proxy_index = 0
-
-    def get_headers(self) -> Dict[str, str]:
-        """Generiert realistische Browser-Headers."""
-        base = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-        }
-        if self.ua:
-            try:
-                base["User-Agent"] = self.ua.random
+                self.faiss_index = faiss.IndexFlatIP(CONFIG["embedding_dim"])
             except Exception:
-                base["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        else:
-            base["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        return base
-
-    def get_proxy(self) -> Optional[str]:
-        """Rotiert durch Proxy-Pool."""
-        if not self.proxy_pool:
-            return None
-        proxy = self.proxy_pool[self.proxy_index % len(self.proxy_pool)]
-        self.proxy_index += 1
-        return proxy
-
-conn_manager = ConnectionManager()
-
-async def fetch_url(url: str, session: aiohttp.ClientSession, 
-                    headers: Dict[str, str], proxy: Optional[str] = None, 
-                    timeout: int = 15, max_retries: int = 2) -> Tuple[int, Optional[bytes], Dict[str, str]]:
-    """Robustes URL-Fetching mit Retry und Rate-Limiting."""
-    if not url or not session:
-        return 0, None, {}
-
-    domain = urlparse(url).netloc or "unknown"
-    await rate_limiter.acquire(domain)
-
-    for attempt in range(max_retries + 1):
-        try:
-            async with session.get(url, headers=headers, proxy=proxy, 
-                                  timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                content = await resp.read() if resp.status == 200 else None
-                if resp.status in (429, 503, 502):
-                    rate_limiter.report_error(domain, backoff_seconds=30 * (attempt + 1))
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                return resp.status, content, dict(resp.headers)
-
-        except asyncio.TimeoutError:
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return 408, None, {}
-        except Exception as e:
-            if attempt < max_retries:
-                logger.debug(f"Fetch Retry {attempt+1}/{max_retries} fuer {domain}: {e}")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            logger.warning(f"Fetch Fehler fuer {url}: {e}")
-            return 0, None, {}
-
-    return 0, None, {}
-
-# =============================================================================
-# DUCKDUCKGO SEARCH (Thread-Safe, nicht-blockierend)
-# =============================================================================
-
-def _ddgs_images_sync(query: str, max_results: int) -> List[Dict]:
-    """Synchrone DDGS Images Suche (wird in Thread ausgefuehrt)."""
-    results = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.images(query, max_results=max_results):
-                results.append(r)
-    except Exception as e:
-        logger.warning(f"DDGS Images Fehler: {e}")
-    return results
-
-def _ddgs_news_sync(query: str, max_results: int) -> List[Dict]:
-    """Synchrone DDGS News Suche."""
-    results = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.news(query, max_results=max_results):
-                results.append(r)
-    except Exception as e:
-        logger.warning(f"DDGS News Fehler: {e}")
-    return results
-
-async def ddgs_images(query: str, max_results: int = 10) -> List[Dict]:
-    """Asynchrone Wrapper fuer DDGS Images."""
-    if not HAS_DDGS:
-        return []
-    return await asyncio.to_thread(_ddgs_images_sync, query, max_results)
-
-async def ddgs_news(query: str, max_results: int = 10) -> List[Dict]:
-    """Asynchrone Wrapper fuer DDGS News."""
-    if not HAS_DDGS:
-        return []
-    return await asyncio.to_thread(_ddgs_news_sync, query, max_results)
-
-# =============================================================================
-# PLATTFORM-SCRAPER (Mit Retry und besserem Parsing)
-# =============================================================================
-
-async def scrape_instagram_profile(session: aiohttp.ClientSession, username: str) -> List[SearchResult]:
-    """Scraped Instagram Profil ueber oEmbed und OG-Tags."""
-    results = []
-    username = sanitize_input(username).lower().replace(' ', '').replace('.', '')
-    if not username:
-        return results
-
-    headers = conn_manager.get_headers()
-
-    # Versuch 1: oEmbed API
-    try:
-        oembed_url = f"https://api.instagram.com/oembed?url=https://www.instagram.com/{username}/"
-        status, content, _ = await fetch_url(oembed_url, session, headers, timeout=10)
-        if status == 200 and content:
-            data = json.loads(content)
-            thumb = data.get("thumbnail_url", "")
-            if validate_url(thumb):
-                results.append(SearchResult(
-                    title=escape_html(data.get("title", f"@{username} auf Instagram")),
-                    url=f"https://www.instagram.com/{username}/",
-                    snippet=escape_html(data.get("author_name", "Instagram Profil")),
-                    source="instagram", platform="Instagram",
-                    thumbnail_url=thumb, match_score=60, found_via="scraping"
-                ))
-    except Exception as e:
-        logger.debug(f"Instagram oEmbed Fehler: {e}")
-
-    # Versuch 2: OG-Tags
-    if not results:
-        try:
-            profile_url = f"https://www.instagram.com/{username}/"
-            status, content, _ = await fetch_url(profile_url, session, headers, timeout=10)
-            if status == 200 and content:
-                html_text = content.decode('utf-8', errors='ignore')
-                og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html_text)
-                og_image = re.search(r'<meta property="og:image" content="([^"]+)"', html_text)
-                og_desc = re.search(r'<meta property="og:description" content="([^"]+)"', html_text)
-
-                thumb = og_image.group(1) if og_image else ""
-                if validate_url(thumb):
-                    results.append(SearchResult(
-                        title=escape_html(og_title.group(1) if og_title else f"@{username} auf Instagram"),
-                        url=profile_url,
-                        snippet=escape_html(og_desc.group(1)[:200] if og_desc else "Instagram Profil"),
-                        source="instagram", platform="Instagram",
-                        thumbnail_url=thumb, match_score=55, found_via="scraping"
-                    ))
-        except Exception as e:
-            logger.debug(f"Instagram OG Fehler: {e}")
-
-    return results
-
-async def scrape_tiktok_profile(session: aiohttp.ClientSession, username: str) -> List[SearchResult]:
-    """Scraped TikTok Profil ueber Universal Data und OG-Tags."""
-    results = []
-    username = sanitize_input(username).lower().replace(' ', '')
-    if not username:
-        return results
-
-    try:
-        url = f"https://www.tiktok.com/@{username}"
-        status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=15)
-        if status == 200 and content:
-            html_text = content.decode('utf-8', errors='ignore')
-
-            # Versuch 1: Universal Data
-            data_match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html_text, re.DOTALL)
-            if data_match:
-                try:
-                    data = json.loads(data_match.group(1))
-                    user_info = data.get("__DEFAULT_SCOPE__", {}).get("webapp.user-detail", {}).get("userInfo", {})
-                    user = user_info.get("user", {})
-                    stats = user_info.get("stats", {})
-                    thumb = user.get("avatarLarger", "")
-                    if validate_url(thumb):
-                        results.append(SearchResult(
-                            title=escape_html(f"@{user.get('uniqueId', username)} auf TikTok"),
-                            url=url,
-                            snippet=escape_html(f"{user.get('nickname', '')} | {stats.get('followerCount', 0)} Follower | {stats.get('videoCount', 0)} Videos"),
-                            source="tiktok", platform="TikTok",
-                            thumbnail_url=thumb, match_score=65, found_via="scraping"
-                        ))
-                except Exception as e:
-                    logger.debug(f"TikTok Universal Data Parse Fehler: {e}")
-
-            # Versuch 2: OG-Tags
-            if not results:
-                og_image = re.search(r'<meta property="og:image" content="([^"]+)"', html_text)
-                og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html_text)
-                if og_title:
-                    thumb = og_image.group(1) if og_image else ""
-                    results.append(SearchResult(
-                        title=escape_html(og_title.group(1)),
-                        url=url, snippet="TikTok Profil",
-                        source="tiktok", platform="TikTok",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=50, found_via="scraping"
-                    ))
-    except Exception as e:
-        logger.debug(f"TikTok Scraping Fehler: {e}")
-
-    return results
-
-async def scrape_twitter_profile(session: aiohttp.ClientSession, username: str) -> List[SearchResult]:
-    """Scraped Twitter/X Profil ueber Nitter-Instanzen."""
-    results = []
-    username = sanitize_input(username).lower().replace(' ', '')
-    if not username:
-        return results
-
-    nitter_instances = ["https://nitter.net", "https://nitter.it", "https://nitter.cz"]
-    for instance in nitter_instances:
-        try:
-            url = f"{instance}/{username}"
-            status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=10)
-            if status == 200 and content and HAS_BS4:
-                soup = BeautifulSoup(content, 'lxml')
-                profile_pic = soup.find('img', class_='profile-card-avatar')
-                bio = soup.find('div', class_='profile-bio')
-                if profile_pic:
-                    thumb = urljoin(instance, profile_pic.get('src', ''))
-                    results.append(SearchResult(
-                        title=escape_html(f"@{username} auf Twitter/X"),
-                        url=f"https://twitter.com/{username}",
-                        snippet=escape_html(bio.get_text(strip=True)[:200] if bio else "Twitter Profil"),
-                        source="twitter", platform="Twitter/X",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=60, found_via="scraping"
-                    ))
-                    break
-        except Exception as e:
-            logger.debug(f"Nitter Fehler {instance}: {e}")
-
-    return results
-
-async def scrape_reddit_profile(session: aiohttp.ClientSession, username: str) -> List[SearchResult]:
-    """Holt Reddit Profil ueber die öffentliche API."""
-    results = []
-    username = sanitize_input(username).lower().replace(' ', '')
-    if not username:
-        return results
-
-    try:
-        url = f"https://www.reddit.com/user/{username}/about.json"
-        headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchBot/6.0"}
-        status, content, _ = await fetch_url(url, session, headers, timeout=10)
-        if status == 200 and content:
-            data = json.loads(content)
-            user_data = data.get("data", {})
-            created_ts = user_data.get('created_utc', 0)
-            created_str = datetime.fromtimestamp(created_ts).strftime('%Y') if created_ts else 'unbekannt'
-            thumb = user_data.get("snoovatar_img", user_data.get("icon_img", ""))
-            results.append(SearchResult(
-                title=escape_html(f"u/{username} auf Reddit"),
-                url=f"https://reddit.com/user/{username}",
-                snippet=escape_html(f"Karma: {user_data.get('total_karma', 0)} | Account: {created_str}"),
-                source="reddit", platform="Reddit",
-                thumbnail_url=thumb if validate_url(thumb) else "",
-                match_score=65, found_via="scraping"
-            ))
-    except Exception as e:
-        logger.debug(f"Reddit Profil Fehler: {e}")
-
-    return results
-
-async def scrape_pinterest_profile(session: aiohttp.ClientSession, name: str) -> List[SearchResult]:
-    """Scraped Pinterest Profil."""
-    results = []
-    clean_name = sanitize_input(name).lower().replace(' ', '')
-    if not clean_name:
-        return results
-
-    try:
-        url = f"https://www.pinterest.com/{clean_name}/"
-        status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=15)
-        if status == 200 and content:
-            html_text = content.decode('utf-8', errors='ignore')
-            data_match = re.search(r'<script id="__PWS_DATA__"[^>]*>(.*?)</script>', html_text, re.DOTALL)
-            if data_match:
-                try:
-                    data = json.loads(data_match.group(1))
-                    user = data.get("props", {}).get("initialReduxState", {}).get("profiles", {}).get(clean_name, {})
-                    thumb = user.get("imageLargeUrl", "")
-                    results.append(SearchResult(
-                        title=escape_html(f"{user.get('fullName', name)} auf Pinterest"),
-                        url=url,
-                        snippet=escape_html(f"{user.get('followerCount', 0)} Follower | {user.get('pinCount', 0)} Pins"),
-                        source="pinterest", platform="Pinterest",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=60, found_via="scraping"
-                    ))
-                except Exception as e:
-                    logger.debug(f"Pinterest Data Parse Fehler: {e}")
-
-            if not results:
-                og_image = re.search(r'<meta property="og:image" content="([^"]+)"', html_text)
-                og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html_text)
-                if og_title:
-                    thumb = og_image.group(1) if og_image else ""
-                    results.append(SearchResult(
-                        title=escape_html(og_title.group(1)),
-                        url=url, snippet="Pinterest Profil",
-                        source="pinterest", platform="Pinterest",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=50, found_via="scraping"
-                    ))
-    except Exception as e:
-        logger.debug(f"Pinterest Scraping Fehler: {e}")
-
-    return results
-
-async def scrape_facebook_profile(session: aiohttp.ClientSession, name: str) -> List[SearchResult]:
-    """Facebook Suche ueber Graph API oder Fallback."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    token = _get_api_key("FACEBOOK_TOKEN")
-    if token:
-        try:
-            url = f"https://graph.facebook.com/v18.0/search?q={quote_plus(name)}&type=page&access_token={token}"
-            status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=15)
-            if status == 200 and content:
-                data = json.loads(content)
-                for page in data.get("data", [])[:3]:
-                    page_id = page.get('id', '')
-                    thumb = f"https://graph.facebook.com/{page_id}/picture?type=large"
-                    results.append(SearchResult(
-                        title=escape_html(page.get("name", "Facebook")),
-                        url=f"https://facebook.com/{page_id}",
-                        snippet=escape_html(f"Facebook Seite | Kategorie: {page.get('category', 'N/A')}"),
-                        source="facebook", platform="Facebook",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=70, found_via="api"
-                    ))
-        except Exception as e:
-            logger.debug(f"Facebook API Fehler: {e}")
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"{name} auf Facebook"),
-            url=f"https://www.facebook.com/search/top/?q={quote_plus(name)}",
-            snippet="Facebook-Suche", source="facebook", platform="Facebook",
-            thumbnail_url="", match_score=40, found_via="fallback"
-        ))
-
-    return results
-
-async def scrape_linkedin_profile(session: aiohttp.ClientSession, name: str) -> List[SearchResult]:
-    """LinkedIn Suche ueber Google Cache oder direkte Suche."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    try:
-        cache_url = f"https://webcache.googleusercontent.com/search?q=site:linkedin.com/in+{quote_plus(name)}"
-        status, content, _ = await fetch_url(cache_url, session, conn_manager.get_headers(), timeout=15)
-        if status == 200 and content and HAS_BS4:
-            soup = BeautifulSoup(content, 'lxml')
-            links = soup.find_all('a', href=re.compile(r'linkedin\.com/in/'))
-            for link in links[:3]:
-                href = link.get('href', '')
-                if 'linkedin.com/in/' in href:
-                    results.append(SearchResult(
-                        title=escape_html(f"{name} auf LinkedIn"),
-                        url=href,
-                        snippet="LinkedIn Profil (via Cache)",
-                        source="linkedin", platform="LinkedIn",
-                        thumbnail_url="", match_score=45, found_via="cache"
-                    ))
-    except Exception as e:
-        logger.debug(f"LinkedIn Cache Fehler: {e}")
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"{name} auf LinkedIn"),
-            url=f"https://www.linkedin.com/search/results/people/?keywords={quote_plus(name)}",
-            snippet="LinkedIn-Suche", source="linkedin", platform="LinkedIn",
-            thumbnail_url="", match_score=40, found_via="fallback"
-        ))
-
-    return results
-
-async def scrape_youtube_channel(session: aiohttp.ClientSession, name: str) -> List[SearchResult]:
-    """YouTube RSS Feed Parser."""
-    results = []
-    name = sanitize_input(name).lower().replace(' ', '')
-    if not name:
-        return results
-
-    try:
-        rss_url = f"https://www.youtube.com/feeds/videos.xml?user={name}"
-        status, content, _ = await fetch_url(rss_url, session, conn_manager.get_headers(), timeout=10)
-        if status == 200 and content:
-            from xml.etree import ElementTree as ET
-            root = ET.fromstring(content)
-            ns = {"atom": "http://www.w3.org/2005/Atom", "media": "http://search.yahoo.com/mrss/"}
-            entries = root.findall(".//atom:entry", ns)[:3]
-            for entry in entries:
-                title = entry.find("atom:title", ns)
-                link = entry.find("atom:link", ns)
-                media = entry.find(".//media:thumbnail", ns)
-                if title is not None:
-                    thumb = media.get("url") if media is not None else ""
-                    results.append(SearchResult(
-                        title=escape_html(title.text or ""),
-                        url=link.get("href") if link is not None else "",
-                        snippet="YouTube Video (via RSS)",
-                        source="youtube", platform="YouTube",
-                        thumbnail_url=thumb if validate_url(thumb) else "",
-                        match_score=60, found_via="rss"
-                    ))
-    except Exception as e:
-        logger.debug(f"YouTube RSS Fehler: {e}")
-
-    return results
-
-
-# =============================================================================
-# API-SUCHE FUNKTIONEN (Mit besserer Auth und Retry)
-# =============================================================================
-
-async def search_youtube_videos(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """YouTube Data API v3 Suche."""
-    results = []
-    name = sanitize_input(name)
-    api_key = _get_api_key("YOUTUBE_API_KEY")
-    if not api_key or not name:
-        return results
-
-    try:
-        url = "https://www.googleapis.com/youtube/v3/search"
-        params = {
-            "part": "snippet",
-            "type": "video",
-            "q": name,
-            "maxResults": min(max_res, 10),
-            "key": api_key
-        }
-        status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=15)
-        if status == 200 and content:
-            data = json.loads(content)
-            for item in data.get("items", []):
-                vid = item["id"]["videoId"]
-                s = item["snippet"]
-                thumb = s.get("thumbnails", {}).get("medium", {}).get("url", "")
-                results.append(SearchResult(
-                    title=escape_html(s.get("title", "YouTube")),
-                    url=f"https://www.youtube.com/watch?v={vid}",
-                    snippet=escape_html(s.get("description", "")[:200]),
-                    source="youtube", platform="YouTube",
-                    thumbnail_url=thumb if validate_url(thumb) else "",
-                    match_score=85, found_via="api"
-                ))
-    except Exception as e:
-        logger.warning(f"YouTube API Fehler: {e}")
-
-    if not results:
-        rss_results = await scrape_youtube_channel(session, name)
-        results.extend(rss_results)
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"YouTube-Suche: {name}"),
-            url=f"https://www.youtube.com/results?search_query={quote_plus(name)}",
-            snippet="Videosuche", source="youtube", platform="YouTube",
-            thumbnail_url="", match_score=50, found_via="fallback"
-        ))
-    return results
-
-async def search_instagram_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Instagram Suche ueber DDGS Images und Scraping."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    # DDGS Images
-    try:
-        ddgs_results = await ddgs_images(f'"{name}" site:instagram.com', max_results=min(max_res, 15))
-        for r in ddgs_results:
-            img = r.get("image", "")
-            thumb = r.get("thumbnail", img)
-            if validate_url(thumb):
-                results.append(SearchResult(
-                    title=escape_html(r.get("title", f"Instagram: {name}")),
-                    url=img if validate_url(img) else f"https://www.instagram.com/{name.lower().replace(' ', '').replace('.', '')}/",
-                    snippet="Instagram", source="instagram", platform="Instagram",
-                    thumbnail_url=thumb, match_score=70, found_via="api"
-                ))
-    except Exception as e:
-        logger.warning(f"Instagram DDGS Fehler: {e}")
-
-    if not results:
-        clean_name = name.lower().replace(' ', '').replace('.', '')
-        scrape_results = await scrape_instagram_profile(session, clean_name)
-        results.extend(scrape_results)
-
-    if not results:
-        clean_name = name.lower().replace(' ', '').replace('.', '')
-        results.append(SearchResult(
-            title=escape_html(f"{name} auf Instagram"),
-            url=f"https://www.instagram.com/{clean_name}/",
-            snippet="Profil", source="instagram", platform="Instagram",
-            thumbnail_url="", match_score=45, found_via="fallback"
-        ))
-    return results
-
-async def search_tiktok_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """TikTok Suche ueber DDGS und Scraping."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    try:
-        ddgs_results = await ddgs_images(f'"{name}" site:tiktok.com', max_results=min(max_res, 10))
-        for r in ddgs_results:
-            img = r.get("image", "")
-            thumb = r.get("thumbnail", img)
-            if validate_url(thumb):
-                results.append(SearchResult(
-                    title=escape_html(r.get("title", f"TikTok: {name}")),
-                    url=img if validate_url(img) else f"https://www.tiktok.com/@{name.lower().replace(' ', '')}",
-                    snippet="TikTok", source="tiktok", platform="TikTok",
-                    thumbnail_url=thumb, match_score=68, found_via="api"
-                ))
-    except Exception as e:
-        logger.warning(f"TikTok DDGS Fehler: {e}")
-
-    if not results:
-        clean_name = name.lower().replace(' ', '')
-        scrape_results = await scrape_tiktok_profile(session, clean_name)
-        results.extend(scrape_results)
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"{name} auf TikTok"),
-            url=f"https://www.tiktok.com/@{name.lower().replace(' ', '')}",
-            snippet="Profil", source="tiktok", platform="TikTok",
-            thumbnail_url="", match_score=45, found_via="fallback"
-        ))
-    return results
-
-async def search_reddit_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Reddit Suche ueber OAuth API oder Scraping."""
-    results = []
-    name = sanitize_input(name)
-    client_id = _get_api_key("REDDIT_CLIENT_ID")
-    client_secret = _get_api_key("REDDIT_CLIENT_SECRET")
-
-    if client_id and client_secret and name:
-        try:
-            auth = aiohttp.BasicAuth(client_id, client_secret)
-            headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchPro/6.0"}
-
-            # OAuth Token
-            token = None
-            async with session.post("https://www.reddit.com/api/v1/access_token",
-                auth=auth, data={"grant_type": "client_credentials"}, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    token_data = await resp.json()
-                    token = token_data.get("access_token")
-
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-                async with session.get("https://oauth.reddit.com/search",
-                    headers=headers, params={"q": name, "type": "link", "limit": min(max_res, 25)},
-                    timeout=aiohttp.ClientTimeout(total=15)) as resp2:
-                    if resp2.status == 200:
-                        data = await resp2.json()
-                        for post in data.get("data", {}).get("children", []):
-                            d = post["data"]
-                            url = d.get("url", "")
-                            is_img = any(ext in url.lower() for ext in [".jpg",".jpeg",".png",".gif","imgur","i.redd.it"])
-                            results.append(SearchResult(
-                                title=escape_html(d.get("title","Reddit")),
-                                url=f"https://reddit.com{d.get('permalink','')}",
-                                snippet=escape_html(f"r/{d.get('subreddit','')}"),
-                                source="reddit", platform="Reddit",
-                                thumbnail_url=url if is_img and validate_url(url) else "",
-                                match_score=75 if is_img else 40, found_via="api"
-                            ))
-        except Exception as e:
-            logger.warning(f"Reddit API Fehler: {e}")
-
-    if not results:
-        clean_name = name.lower().replace(' ', '')
-        scrape_results = await scrape_reddit_profile(session, clean_name)
-        results.extend(scrape_results)
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"Reddit-Suche: {name}"),
-            url=f"https://www.reddit.com/search/?q={quote_plus(name)}",
-            snippet="Suche", source="reddit", platform="Reddit",
-            thumbnail_url="", match_score=40, found_via="fallback"
-        ))
-    return results
-
-async def search_twitter_media(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Twitter/X Suche ueber API v2 oder Nitter Scraping."""
-    results = []
-    name = sanitize_input(name)
-    clean_handle = name.lower().replace(' ', '')
-    bearer = _get_api_key("TWITTER_BEARER_TOKEN")
-
-    if bearer and clean_handle:
-        try:
-            headers = {**conn_manager.get_headers(), "Authorization": f"Bearer {bearer}"}
-            async with session.get("https://api.twitter.com/2/users/by",
-                headers=headers,
-                params={"usernames": clean_handle, "user.fields": "profile_image_url,description"},
-                timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for u in data.get("data", []):
-                        thumb = u.get("profile_image_url","").replace("_normal","_400x400")
-                        results.append(SearchResult(
-                            title=escape_html(f"@{u.get('username',clean_handle)} auf X/Twitter"),
-                            url=f"https://twitter.com/{u.get('username',clean_handle)}",
-                            snippet=escape_html(u.get("description","")),
-                            source="twitter", platform="Twitter/X",
-                            thumbnail_url=thumb if validate_url(thumb) else "",
-                            match_score=80, found_via="api"
-                        ))
-        except Exception as e:
-            logger.warning(f"Twitter API Fehler: {e}")
-
-    if not results:
-        scrape_results = await scrape_twitter_profile(session, clean_handle)
-        results.extend(scrape_results)
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"{name} auf Twitter/X"),
-            url=f"https://twitter.com/{clean_handle}",
-            snippet="Profil", source="twitter", platform="Twitter/X",
-            thumbnail_url="", match_score=50, found_via="fallback"
-        ))
-    return results
-
-async def search_facebook_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Facebook Suche."""
-    return await scrape_facebook_profile(session, name)
-
-async def search_pinterest_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Pinterest Suche ueber DDGS und Scraping."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    try:
-        ddgs_results = await ddgs_images(f'"{name}" site:pinterest.com', max_results=min(max_res, 10))
-        for r in ddgs_results:
-            img = r.get("image", "")
-            thumb = r.get("thumbnail", img)
-            if validate_url(thumb):
-                results.append(SearchResult(
-                    title=escape_html(r.get("title", f"Pinterest: {name}")),
-                    url=img,
-                    snippet="Pinterest", source="pinterest", platform="Pinterest",
-                    thumbnail_url=thumb, match_score=65, found_via="api"
-                ))
-    except Exception as e:
-        logger.warning(f"Pinterest DDGS Fehler: {e}")
-
-    if not results:
-        scrape_results = await scrape_pinterest_profile(session, name)
-        results.extend(scrape_results)
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"Pinterest-Suche: {name}"),
-            url=f"https://www.pinterest.de/search/pins/?q={quote_plus(name)}",
-            snippet="Suche", source="pinterest", platform="Pinterest",
-            thumbnail_url="", match_score=40, found_via="fallback"
-        ))
-    return results
-
-async def search_linkedin_posts(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """LinkedIn Suche."""
-    return await scrape_linkedin_profile(session, name)
-
-async def search_duckduckgo_images(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """Allgemeine Web-Bildersuche ueber DDGS."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    try:
-        ddgs_results = await ddgs_images(name, max_results=min(max_res, 20))
-        for r in ddgs_results:
-            img = r.get("image", "")
-            thumb = r.get("thumbnail", img)
-            if validate_url(thumb):
-                results.append(SearchResult(
-                    title=escape_html(r.get("title","Web")),
-                    url=img,
-                    snippet=escape_html(r.get("source","Web")),
-                    source="web", platform="Web",
-                    thumbnail_url=thumb, match_score=55, found_via="api"
-                ))
-    except Exception as e:
-        logger.warning(f"DDGS Images Fehler: {e}")
-    return results
-
-async def search_news(session: aiohttp.ClientSession, name: str, max_res: int) -> List[SearchResult]:
-    """News-Suche ueber DDGS."""
-    results = []
-    name = sanitize_input(name)
-    if not name:
-        return results
-
-    try:
-        ddgs_results = await ddgs_news(name, max_results=min(max_res, 10))
-        for r in ddgs_results:
-            thumb = r.get("image", "")
-            results.append(SearchResult(
-                title=escape_html(r.get("title","News")),
-                url=r.get("url",""),
-                snippet=escape_html(r.get("source","News")),
-                source="news", platform="News",
-                thumbnail_url=thumb if validate_url(thumb) else "",
-                match_score=50, found_via="api"
-            ))
-    except Exception as e:
-        logger.warning(f"News DDGS Fehler: {e}")
-
-    if not results:
-        results.append(SearchResult(
-            title=escape_html(f"News-Suche: {name}"),
-            url=f"https://news.google.com/search?q={quote_plus(name)}",
-            snippet="News", source="news", platform="News",
-            thumbnail_url="", match_score=40, found_via="fallback"
-        ))
-    return results
-
-# =============================================================================
-# ASYNC SEARCHER ORCHESTRATOR
-# =============================================================================
+                pass
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS face_cache (
+            id INTEGER PRIMARY KEY, url TEXT UNIQUE, embedding BLOB,
+            timestamp REAL, metadata TEXT
+        )""")
+        conn.commit()
+        conn.close()
+    def get(self, url: str) -> Optional[np.ndarray]:
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT embedding, timestamp FROM face_cache WHERE url=?", (url,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            if time.time() - row[1] < CONFIG["ttl_seconds"]:
+                return np.frombuffer(row[0], dtype=np.float32)
+        return None
+    def put(self, url: str, embedding: np.ndarray, metadata: dict = None):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO face_cache (url, embedding, timestamp, metadata) VALUES (?,?,?,?)",
+                  (url, embedding.tobytes(), time.time(), json.dumps(metadata or {})))
+        conn.commit()
+        conn.close()
 
 class AsyncSearcher:
-    """Orchestriert parallele Suchen ueber alle Plattformen."""
-
+    """Orchestrates TinEye/Bing/Yandex/Social parallel + Username Enumeration."""
     def __init__(self):
-        self.results: List[SearchResult] = []
-        self.progress = {"total": 0, "completed": 0, "errors": []}
-
-    async def search(self, query: SearchQuery, ref_embedding: Optional[np.ndarray] = None,
-                     progress_callback=None) -> List[SearchResult]:
-        """Fuehrt die komplette Suche durch."""
-
-        # Cache-Check
-        qhash = _query_hash(query)
-        cached = vector_db.get_search_cache(qhash)
-        if cached:
-            logger.info("Cache-Hit fuer Query")
-            results = []
-            for c in cached:
-                r = SearchResult(**c)
-                if r.face_similarity is None and ref_embedding is not None and r.thumbnail_url:
-                    sim, detected = await self._bio_analyze_single(r.thumbnail_url, ref_embedding)
-                    r.face_similarity = sim
-                    r.face_detected = detected
-                results.append(r)
-            return results
-
-        name = query.person_name or ""
-        max_r = query.max_results
-
-        engine_map = {
-            "google":     lambda s: self._manual_result("Google Lens", "https://lens.google.com/upload", "Bild hochladen", "google"),
-            "bing":       lambda s: self._manual_result("Bing Visual", "https://www.bing.com/images/search?view=detailv2&iss=sbi", "Drag & Drop", "bing"),
-            "duckduckgo": lambda s: search_duckduckgo_images(s, name, max_r),
-            "youtube":    lambda s: search_youtube_videos(s, name, max_r),
-            "instagram":  lambda s: search_instagram_posts(s, name, max_r),
-            "tiktok":     lambda s: search_tiktok_posts(s, name, max_r),
-            "reddit":     lambda s: search_reddit_posts(s, name, max_r),
-            "twitter":    lambda s: search_twitter_media(s, name, max_r),
-            "facebook":   lambda s: search_facebook_posts(s, name, max_r),
-            "pinterest":  lambda s: search_pinterest_posts(s, name, max_r),
-            "linkedin":   lambda s: search_linkedin_posts(s, name, max_r),
-            "news":       lambda s: search_news(s, name, max_r),
-        }
-
-        async with managed_session() as session:
-            tasks = []
-            valid_engines = []
-            for en in query.engines:
-                if en in engine_map:
-                    valid_engines.append(en)
-                    tasks.append(asyncio.create_task(
-                        self._safe_search(en, engine_map[en], session)
-                    ))
-
-            self.progress["total"] = len(tasks)
-            self.progress["completed"] = 0
-
-            # Sammle Ergebnisse mit Fortschritt
-            results = []
-            for coro in asyncio.as_completed(tasks):
-                try:
-                    batch = await coro
-                    if isinstance(batch, list):
-                        results.extend(batch)
-                    self.progress["completed"] += 1
-                    if progress_callback:
-                        progress_callback(self.progress)
-                except Exception as e:
-                    self.progress["errors"].append(str(e))
-                    self.progress["completed"] += 1
-                    logger.error(f"Search Batch Fehler: {e}")
-
-            # Biometrische Analyse
-            if ref_embedding is not None and HAS_BIOMETRIE and bio_analyzer is not None:
-                await self._batch_bio_analyze(results, ref_embedding, session)
-
-            # Scoring und Sortierung
-            def combined_score(r: SearchResult) -> float:
-                text = r.match_score or 0
-                bio = (r.face_similarity or 0) * 100
-                if r.face_detected:
-                    return bio * 0.7 + text * 0.3
-                return text
-
-            results.sort(key=combined_score, reverse=True)
-
-            # Cache speichern
-            vector_db.save_search_cache(qhash, results)
-            return results
-
-    async def _safe_search(self, engine_name: str, func, session: aiohttp.ClientSession):
-        """Wrapper mit Circuit-Breaker und Fehler-Handling."""
-        try:
-            return await circuit_breaker.call(engine_name, func, session)
-        except Exception as e:
-            logger.warning(f"Engine {engine_name} Fehler: {e}")
-            return []
-
-    async def _batch_bio_analyze(self, results: List[SearchResult], 
-                                  ref_embedding: np.ndarray,
-                                  session: aiohttp.ClientSession):
-        """Batch-Biometrie-Analyse fuer Thumbnails."""
-        if bio_analyzer is None:
-            return
-
-        # Sammle Thumbnails
-        thumbs = [(i, r.thumbnail_url) for i, r in enumerate(results) 
-                  if r.thumbnail_url and validate_url(r.thumbnail_url)]
-
-        if not thumbs:
-            return
-
-        # Lade Bilder
-        img_tasks = [fetch_url(url, session, conn_manager.get_headers(), timeout=10) 
-                     for _, url in thumbs]
-        img_results = await asyncio.gather(*img_tasks, return_exceptions=True)
-
-        img_bytes = []
-        valid_indices = []
-        for idx, (orig_idx, url) in enumerate(thumbs):
-            res = img_results[idx]
-            if isinstance(res, tuple) and len(res) == 3:
-                status, content, _ = res
-                if status == 200 and content:
-                    img_bytes.append(content)
-                    valid_indices.append(orig_idx)
-
-        if not img_bytes:
-            return
-
-        # Extrahiere Embeddings
-        embeddings = await bio_analyzer.batch_extract(img_bytes)
-
-        for orig_idx, emb in zip(valid_indices, embeddings):
-            if emb is not None:
-                sim = bio_analyzer.compare_embeddings(ref_embedding, emb)
-                results[orig_idx].face_similarity = sim
-                results[orig_idx].face_detected = True
-                vector_db.save_embedding(
-                    results[orig_idx].thumbnail_url or "",
-                    results[orig_idx].source,
-                    results[orig_idx].platform,
-                    emb,
-                    True
-                )
+        self.rate_limiter = AdaptiveRateLimiter()
+        self.vector_db = VectorDatabase()
+        self.biometric = BiometricAnalyzer()
+        self.session = None
+    async def _get_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CONFIG["request_timeout"]))
+        return self.session
+    async def search_all(self, image_bytes: bytes) -> Dict[str, Any]:
+        session = await self._get_session()
+        results = {"reverse_image": [], "social_deep": [], "username_enum": [], "exif": {}, "hashes": {}, "qr_codes": [], "warnings": []}
+        # EXIF Analysis
+        results["exif"] = self._analyze_exif(image_bytes)
+        # Image Hashes
+        results["hashes"] = self._compute_hashes(image_bytes)
+        # QR/Barcode
+        results["qr_codes"] = self._scan_qr(image_bytes)
+        # Reverse Image Search (parallel)
+        tasks = [
+            self.tineye_search(image_bytes, session),
+            self.bing_visual_search(image_bytes, session),
+            self.yandex_search(image_bytes, session),
+        ]
+        if DDGS:
+            tasks.append(self.ddgs_image_search(image_bytes, session))
+        reverse_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in reverse_results:
+            if isinstance(r, Exception):
+                results["warnings"].append(str(r))
             else:
-                results[orig_idx].face_detected = False
-
-    async def _bio_analyze_single(self, url: str, ref_embedding: np.ndarray) -> Tuple[Optional[float], bool]:
-        """Einzelne Biometrie-Analyse."""
-        if bio_analyzer is None or not validate_url(url):
-            return None, False
-
-        async with managed_session() as session:
-            status, content, _ = await fetch_url(url, session, conn_manager.get_headers(), timeout=10)
-            if status == 200 and content:
-                emb = await asyncio.to_thread(bio_analyzer.extract_from_bytes, content)
-                if emb is not None:
-                    sim = bio_analyzer.compare_embeddings(ref_embedding, emb)
-                    vector_db.save_embedding(url, "", "", emb, True)
-                    return sim, True
-        return None, False
-
-    def _manual_result(self, title: str, url: str, snippet: str, source: str) -> List[SearchResult]:
-        return [SearchResult(title=title, url=url, snippet=snippet, source=source, 
-                           platform=source.title(), match_score=None, found_via="manual")]
-
-# =============================================================================
-# HILFSFUNKTIONEN
-# =============================================================================
-
-def save_temp_image(uploaded_file) -> Optional[str]:
-    """Speichert hochgeladenes Bild temporaer."""
-    if uploaded_file is None:
-        return None
-    try:
-        tmp = APP_DIR / "uploads"
-        tmp.mkdir(parents=True, exist_ok=True)
-        name = hashlib.md5(uploaded_file.getvalue()).hexdigest() + ".jpg"
-        path = tmp / name
-        with open(path, "wb") as f:
-            f.write(uploaded_file.getvalue())
-        return str(path)
-    except Exception as e:
-        logger.error(f"Fehler beim Speichern: {e}")
-        return None
-
-def add_to_history(query: str):
-    """Fuegt Query zum Verlauf hinzu (mit Limit)."""
-    if not query:
-        return
-    hist = st.session_state.search_history
-    if query in hist:
-        hist.remove(query)
-    hist.insert(0, query)
-    while len(hist) > MAX_HISTORY:
-        hist.pop()
-
-def toggle_bookmark(result: SearchResult) -> bool:
-    """Toggle Lesezeichen mit Limit."""
-    bm_list = st.session_state.bookmarks
-    existing = next((b for b in bm_list if b["url"] == result.url), None)
-    if existing:
-        bm_list.remove(existing)
-        return False
-    else:
-        if len(bm_list) >= MAX_BOOKMARKS:
-            bm_list.pop(0)  # FIFO
-        bm_list.append({
-            "title": result.title,
-            "url": result.url,
-            "source": result.source,
-            "thumbnail": result.thumbnail_url
-        })
-        return True
-
-def _make_key(url: str) -> str:
-    return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
-
-def _query_hash(query: SearchQuery) -> str:
-    raw = f"{query.image_path}|{query.person_name}|{','.join(sorted(query.engines))}|{query.max_results}"
-    return hashlib.md5(raw.encode()).hexdigest()
-
-
-# =============================================================================
-# UI KOMPONENTEN
-# =============================================================================
-
-def init_session():
-    """Initialisiert Session State mit Validierung."""
-    defaults = {
-        'dark_mode': False,
-        'search_history': [],
-        'bookmarks': [],
-        'legal_accepted': False,
-        'match_votes': {},
-        'last_results': [],
-        'search_count': 0,
-        'last_query_name': "",
-        'ref_embedding': None,
-        'ref_face_hash': "",
-        'bio_enabled': True,
-        'search_progress': 0,
-        'search_total': 0,
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-    # Cleanup alter Votes
-    if len(st.session_state.match_votes) > MAX_VOTES:
-        # Behalte nur die neuesten 200
-        items = list(st.session_state.match_votes.items())
-        st.session_state.match_votes = dict(items[-MAX_VOTES:])
-
-def legal_notice():
-    """Zeigt rechtlichen Hinweis mit einmaliger Akzeptanz."""
-    if not st.session_state.legal_accepted:
-        st.markdown("""
-        <div style="background:#1e1e2e;padding:20px;border-radius:10px;border-left:4px solid #ff6b6b;margin-bottom:20px;">
-            <h3>Rechtlicher Hinweis & Datenschutz</h3>
-            <p><b>Biometrische Gesichtsanalyse ist hochsensibel.</b></p>
-            <ul>
-                <li>NUR fuer eigene Inhalte oder mit schriftlicher Einwilligung</li>
-                <li>Alle Embeddings werden <b>lokal</b> gespeichert (FAISS/SQLite)</li>
-                <li>DSGVO Art. 9: Biometrische Daten sind besondere Kategorien</li>
-                <li>Missbrauch biometrischer Daten ist strafbar (StGB 202a ff.)</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
-
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("Ich akzeptiere", type="primary", use_container_width=True, key="accept_legal"):
-                st.session_state.legal_accepted = True
-                st.rerun()
-        with col2:
-            st.caption("Durch Klicken bestaetigen Sie die ausschliesslich legale Nutzung.")
-        st.stop()
-
-def apply_dark_mode():
-    """Wendet Dark Mode CSS an."""
-    if st.session_state.dark_mode:
-        st.markdown("""
-        <style>
-        .stApp { background-color: #0f0f23; color: #e0e0e0; }
-        .stTextInput > div > div > input { background-color: #1a1a2e; color: #e0e0e0; }
-        .stButton > button { background-color: #2d2d44; color: #e0e0e0; border: 1px solid #4a4a6a; }
-        .stCheckbox > label { color: #e0e0e0; }
-        .stSlider > div > div > div { color: #e0e0e0; }
-        h1, h2, h3, h4 { color: #ffffff; }
-        .stMetric { background-color: #1a1a2e; padding: 10px; border-radius: 8px; }
-        </style>
-        """, unsafe_allow_html=True)
-
-def sidebar():
-    """Rendert die Sidebar mit System-Status."""
-    with st.sidebar:
-        st.header("Einstellungen")
-
-        dark = st.toggle("Dark Mode", value=st.session_state.dark_mode, key="toggle_dark")
-        if dark != st.session_state.dark_mode:
-            st.session_state.dark_mode = dark
-            st.rerun()
-
-        st.divider()
-        st.markdown("**System-Status**")
-
-        status_cols = st.columns(2)
-        with status_cols[0]:
-            st.write(f"FAISS: {'Ja' if HAS_FAISS else 'Nein'}")
-            st.write(f"OpenCV: {'Ja' if HAS_BIOMETRIE else 'Nein'}")
-        with status_cols[1]:
-            st.write(f"ONNX: {'Ja' if HAS_ONNX else 'Nein'}")
-            st.write(f"Async: Ja")
-
-        stats = vector_db.get_stats()
-        st.write(f"DB-Vektoren: {stats['total_vectors']} ({stats['backend']})")
-
-        st.divider()
-
-        with st.expander(f"Verlauf ({len(st.session_state.search_history)})"):
-            for i, h in enumerate(st.session_state.search_history[:10]):
-                st.text(f"{i+1}. {h}")
-
-        with st.expander(f"Lesezeichen ({len(st.session_state.bookmarks)})"):
-            for bm in st.session_state.bookmarks[:]:
-                cols = st.columns([4, 1])
-                with cols[0]:
-                    st.markdown(f"**[{bm['title'][:25]}...]({bm['url']})**")
-                with cols[1]:
-                    if st.button("X", key=f"del_{_make_key(bm['url'])}"):
-                        st.session_state.bookmarks.remove(bm)
-                        st.rerun()
-
-        st.divider()
-        st.caption("FaceSearch Bio Pro v6.0")
-
-# =============================================================================
-# PDF EXPORT (Mit Unicode-Support)
-# =============================================================================
-
-class UnicodePDF(FPDF):
-    """PDF-Generator mit Unicode-Unterstuetzung via fpdf2."""
-
-    def header(self):
-        self.set_font("Helvetica", "B", 16)
-        self.cell(0, 10, "FaceSearch Bio Pro v6.0 - Bericht", ln=True, align="C")
-        self.set_font("Helvetica", "", 10)
-        self.cell(0, 6, f"Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}", ln=True, align="C")
-        self.ln(5)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", align="C")
-
-    def safe_cell(self, text: str, **kwargs):
-        """Cell mit ASCII-Fallback fuer nicht unterstuetzte Zeichen."""
-        safe_text = text.encode("latin-1", "replace").decode("latin-1")
-        self.cell(txt=safe_text, **kwargs)
-
-def generate_pdf(results: List[SearchResult], query_name: str) -> bytes:
-    """Generiert Unicode-faehiges PDF."""
-    try:
-        pdf = UnicodePDF()
-        pdf.alias_nb_pages()
-        pdf.add_page()
-        pdf.set_auto_page_break(auto=True, margin=15)
-
-        # Query Info
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.safe_cell(f"Suchbegriff: {query_name}", ln=True)
-        pdf.ln(3)
-
-        # Statistiken
-        bio_hits = sum(1 for r in results if r.face_detected)
-        high_conf = sum(1 for r in results if r.face_similarity and r.face_similarity >= SIMILARITY_THRESHOLD)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.safe_cell(f"Gesamttreffer: {len(results)} | Mit Gesicht: {bio_hits} | High-Confidence: {high_conf}", ln=True)
-        pdf.ln(5)
-
-        # Ergebnisse
-        for r in results:
-            pdf.set_font("Helvetica", "B", 11)
-            title = r.title[:80] if r.title else "Unbekannt"
-            pdf.safe_cell(title, ln=True)
-
-            pdf.set_font("Helvetica", "", 9)
-            pdf.safe_cell(
-                f"Plattform: {r.platform} | Text: {r.match_score or '-'}% | "
-                f"Bio: {round(r.face_similarity*100,1) if r.face_similarity else '-'}% | Via: {r.found_via}",
-                ln=True
-            )
-
-            # URL als Link
-            pdf.set_text_color(0, 0, 255)
-            pdf.safe_cell(r.url[:100], ln=True, link=r.url)
-            pdf.set_text_color(0, 0, 0)
-
-            # Bewertung
-            vote = st.session_state.match_votes.get(r.url, None)
-            if vote is not None:
-                pdf.set_font("Helvetica", "B", 9)
-                pdf.safe_cell(f"Bewertung: {'TREFFER' if vote else 'KEIN TREFFER'}", ln=True)
-                pdf.set_font("Helvetica", "", 9)
-
-            pdf.ln(3)
-
-        return pdf.output()
-    except Exception as e:
-        logger.error(f"PDF Generierung Fehler: {e}")
-        # Fallback: Minimal-PDF
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "FaceSearch Bio Pro v6.0", ln=True, align="C")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 10, f"Fehler bei PDF-Erstellung: {str(e)[:100]}", ln=True)
-        return pdf.output()
-
-# =============================================================================
-# ERGEBNIS-DARSTELLUNG
-# =============================================================================
-
-def display_results_table(results: List[SearchResult]):
-    """Zeigt Ergebnisse mit Filtern, Charts und Export."""
-    if not results:
-        st.warning("Keine Treffer gefunden.")
-        return
-
-    st.subheader(f"Ergebnisse ({len(results)} Treffer)")
-
-    # Statistik-Charts
-    src_counts = defaultdict(int)
-    for r in results:
-        src_counts[r.platform] += 1
-
-    if src_counts:
-        colors = ['#FF0000','#E1306C','#000000','#FF4500','#1DA1F2','#1877F2','#BD081C','#0077B5','#34A853','#FF6B6B']
-        fig = go.Figure(go.Bar(
-            x=list(src_counts.keys()), 
-            y=list(src_counts.values()), 
-            marker_color=colors[:len(src_counts)]
-        ))
-        fig.update_layout(
-            title="Treffer pro Plattform", 
-            height=300,
-            template="plotly_dark" if st.session_state.dark_mode else "plotly_white",
-            margin=dict(l=20, r=20, t=40, b=20)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    via_counts = defaultdict(int)
-    for r in results:
-        via_counts[r.found_via] += 1
-
-    if via_counts:
-        fig2 = go.Figure(go.Pie(
-            labels=list(via_counts.keys()), 
-            values=list(via_counts.values()),
-            hole=0.4
-        ))
-        fig2.update_layout(
-            title="Gefunden via", 
-            height=250,
-            template="plotly_dark" if st.session_state.dark_mode else "plotly_white"
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # Metriken
-    bio_hits = sum(1 for r in results if r.face_detected)
-    high_conf = sum(1 for r in results if r.face_similarity and r.face_similarity >= SIMILARITY_THRESHOLD)
-    with_thumbs = sum(1 for r in results if r.thumbnail_url)
-    vals = [r.face_similarity for r in results if r.face_similarity]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Mit Bild", with_thumbs)
-    c2.metric("Gesicht erkannt", bio_hits)
-    c3.metric("Bio-Match >=65%", high_conf)
-    c4.metric("Durchschnitt Bio", f"{np.mean(vals):.1%}" if vals else "n/a")
-
-    st.markdown("---")
-
-    # Filter
-    st.markdown("### Filter")
-    all_platforms = sorted(list(set(r.platform for r in results)))
-
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        selected = st.multiselect("Plattform:", all_platforms, default=all_platforms, key="platform_filter")
-    with col_f2:
-        min_score = st.slider("Min. Text-Score:", 0, 100, 0, key="txt_slider")
-    with col_f3:
-        min_bio = st.slider("Min. Bio-Score:", 0.0, 1.0, 0.0, key="bio_slider")
-
-    filtered = [r for r in results 
-                if r.platform in selected
-                and (r.match_score or 0) >= min_score
-                and (r.face_similarity or 0) >= min_bio]
-
-    if not filtered:
-        st.info("Keine Treffer mit aktiven Filtern.")
-        return
-
-    # Bewertungs-Statistik
-    my = sum(1 for r in filtered if st.session_state.match_votes.get(r.url) is True)
-    mn = sum(1 for r in filtered if st.session_state.match_votes.get(r.url) is False)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Treffer", my, delta=my)
-    c2.metric("Nein", mn, delta=-mn)
-    c3.metric("Offen", len(filtered)-my-mn)
-    st.markdown("---")
-
-    # Ergebnis-Liste
-    st.markdown(f"### Gefilterte Treffer ({len(filtered)})")
-
-    for idx, r in enumerate(filtered):
-        kb = _make_key(r.url)
-
-        with st.container():
-            cols = st.columns([1, 3, 1])
-
-            with cols[0]:
-                # Thumbnail
-                if r.thumbnail_url and validate_url(r.thumbnail_url):
-                    try:
-                        st.image(r.thumbnail_url, width=120)
-                    except Exception:
-                        st.markdown("<div style='width:120px;height:90px;background:#333;display:flex;align-items:center;justify-content:center;border-radius:6px;'><span style='font-size:24px;'>Bild</span></div>", unsafe_allow_html=True)
+                results["reverse_image"].extend(r)
+        # Biometric Verification of found images
+        if results["reverse_image"]:
+            ref_emb = self.biometric.extract_embedding(cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR))
+            social_tasks = [self._verify_image(url, ref_emb, session) for url in results["reverse_image"][:10]]
+            social_results = await asyncio.gather(*social_tasks, return_exceptions=True)
+            for sr in social_results:
+                if isinstance(sr, dict) and sr.get("match"):
+                    results["social_deep"].append(sr)
+        return results
+    def _analyze_exif(self, image_bytes: bytes) -> Dict:
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            exif = img._getexif()
+            if not exif:
+                return {}
+            data = {}
+            gps = {}
+            for tag_id, value in exif.items():
+                tag = ExifTags.TAGS.get(tag_id, tag_id)
+                if tag == "GPSInfo":
+                    for gps_tag_id, gps_value in value.items():
+                        gps_tag = GPSTAGS.get(gps_tag_id, gps_tag_id)
+                        gps[gps_tag] = gps_value
                 else:
-                    st.markdown("<div style='width:120px;height:90px;background:#e9ecef;display:flex;align-items:center;justify-content:center;border-radius:6px;'><span style='font-size:24px;'>Suche</span></div>", unsafe_allow_html=True)
+                    data[tag] = str(value)
+            if gps:
+                data["GPS"] = gps
+                # Convert to decimal degrees
+                try:
+                    lat = self._convert_gps(gps.get("GPSLatitude"), gps.get("GPSLatitudeRef"))
+                    lon = self._convert_gps(gps.get("GPSLongitude"), gps.get("GPSLongitudeRef"))
+                    if lat and lon:
+                        data["GPS_Decimal"] = {"lat": lat, "lon": lon}
+                        if GEOPY:
+                            try:
+                                geolocator = Nominatim(user_agent="facesearch_osint")
+                                location = geolocator.reverse(f"{lat}, {lon}", language="de")
+                                data["GPS_Address"] = location.address if location else None
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            return data
+        except Exception as e:
+            return {"error": str(e)}
+    def _convert_gps(self, coords, ref):
+        if not coords or not ref:
+            return None
+        d, m, s = [float(x) for x in coords]
+        decimal = d + m/60 + s/3600
+        if ref in ["S", "W"]:
+            decimal = -decimal
+        return decimal
+    def _compute_hashes(self, image_bytes: bytes) -> Dict[str, str]:
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            hashes = {
+                "md5": hashlib.md5(image_bytes).hexdigest(),
+                "sha1": hashlib.sha1(image_bytes).hexdigest(),
+                "sha256": hashlib.sha256(image_bytes).hexdigest(),
+            }
+            if IHASH:
+                hashes["ahash"] = str(imagehash.average_hash(img))
+                hashes["phash"] = str(imagehash.phash(img))
+                hashes["dhash"] = str(imagehash.dhash(img))
+                hashes["whash"] = str(imagehash.whash(img))
+            return hashes
+        except Exception as e:
+            return {"error": str(e)}
+    def _scan_qr(self, image_bytes: bytes) -> List[Dict]:
+        if not PYZBAR:
+            return []
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            codes = zbar_decode(img)
+            return [{"data": c.data.decode("utf-8"), "type": c.type} for c in codes]
+        except Exception:
+            return []
+    async def tineye_search(self, image_bytes: bytes, session: aiohttp.ClientSession) -> List[str]:
+        await self.rate_limiter.acquire("tineye.com")
+        try:
+            data = aiohttp.FormData()
+            data.add_field("image", io.BytesIO(image_bytes), filename="search.jpg", content_type="image/jpeg")
+            async with session.post("https://tineye.com/api/v1/search/", data=data, headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    json_data = await resp.json()
+                    return [r["image_url"] for r in json_data.get("results", [])[:CONFIG["max_results_per_engine"]]]
+                return []
+        except Exception as e:
+            return []
+    async def bing_visual_search(self, image_bytes: bytes, session: aiohttp.ClientSession) -> List[str]:
+        await self.rate_limiter.acquire("bing.com")
+        try:
+            # Bing Visual Search via their image upload endpoint (unofficial, may break)
+            data = aiohttp.FormData()
+            data.add_field("image", io.BytesIO(image_bytes), filename="search.jpg", content_type="image/jpeg")
+            async with session.post("https://www.bing.com/images/search?view=detailv2&iss=sbiupload", data=data, headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                text = await resp.text()
+                if BS4:
+                    soup = BeautifulSoup(text, "html.parser")
+                    links = [a["href"] for a in soup.find_all("a", href=True) if a["href"].startswith("http")]
+                    return links[:CONFIG["max_results_per_engine"]]
+                return []
+        except Exception:
+            return []
+    async def yandex_search(self, image_bytes: bytes, session: aiohttp.ClientSession) -> List[str]:
+        await self.rate_limiter.acquire("yandex.com")
+        try:
+            data = aiohttp.FormData()
+            data.add_field("upfile", io.BytesIO(image_bytes), filename="search.jpg", content_type="image/jpeg")
+            async with session.post("https://yandex.com/images/search?rpt=imageview", data=data, headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                text = await resp.text()
+                if BS4:
+                    soup = BeautifulSoup(text, "html.parser")
+                    links = []
+                    for a in soup.find_all("a", href=True):
+                        href = a["href"]
+                        if href.startswith("http") and any(d in href for d in CONFIG["social_domains"]):
+                            links.append(href)
+                    return links[:CONFIG["max_results_per_engine"]]
+                return []
+        except Exception:
+            return []
+    async def ddgs_image_search(self, image_bytes: bytes, session: aiohttp.ClientSession) -> List[str]:
+        if not DDGS:
+            return []
+        try:
+            # DDGS doesn't support image upload directly, but we can search for similar images by hash
+            img_hash = hashlib.md5(image_bytes).hexdigest()
+            with DDGS() as ddgs:
+                results = ddgs.images(img_hash, max_results=CONFIG["max_results_per_engine"])
+                return [r["image"] for r in results if "image" in r]
+        except Exception:
+            return []
+    async def _verify_image(self, url: str, ref_emb: np.ndarray, session: aiohttp.ClientSession) -> Dict:
+        cached = self.vector_db.get(url)
+        if cached is not None:
+            sim = self.biometric.compute_similarity(ref_emb, cached)
+            return {"url": url, "match": sim > CONFIG["similarity_threshold"], "similarity": sim, "source": "cache"}
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers={"User-Agent":"Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    img_bytes = await resp.read()
+                    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        faces = self.biometric.detect_faces(img)
+                        if faces:
+                            x1,y1,x2,y2,_ = faces[0]
+                            face_img = img[y1:y2, x1:x2]
+                            emb = self.biometric.extract_embedding(face_img)
+                            self.vector_db.put(url, emb, {"source": url})
+                            sim = self.biometric.compute_similarity(ref_emb, emb)
+                            return {"url": url, "match": sim > CONFIG["similarity_threshold"], "similarity": sim, "source": "live"}
+        except Exception:
+            pass
+        return {"url": url, "match": False, "similarity": 0.0, "source": "failed"}
+    async def username_enumeration(self, username: str, max_sites: int = 50) -> List[Dict]:
+        """Sherlock-style username enumeration across platforms."""
+        results = []
+        session = await self._get_session()
+        sites = USERNAME_SITES[:max_sites]
 
-                # Bio-Score Badge
-                if r.face_detected and r.face_similarity is not None:
-                    color = "#4CAF50" if r.face_similarity >= SIMILARITY_THRESHOLD else "#FFC107"
-                    st.markdown(f"<div style='background:{color};color:white;padding:2px 6px;border-radius:4px;font-size:11px;text-align:center;margin-top:4px;'>Bio: {r.face_similarity:.0%}</div>", unsafe_allow_html=True)
-                elif r.face_detected is False:
-                    st.markdown("<div style='background:#666;color:white;padding:2px 6px;border-radius:4px;font-size:11px;text-align:center;margin-top:4px;'>Kein Gesicht</div>", unsafe_allow_html=True)
+        async def check_site(site):
+            url = site["url"].format(username)
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True) as resp:
+                    status = resp.status
+                    final_url = str(resp.url)
+                    # Heuristics for existence
+                    exists = False
+                    if status == 200:
+                        # Check if we were redirected to a login page or error page
+                        if "login" in final_url.lower() or "signin" in final_url.lower():
+                            exists = False
+                        else:
+                            text = await resp.text()
+                            # Check for common "not found" indicators
+                            not_found_indicators = [
+                                "not found", "404", "doesn't exist", "does not exist",
+                                "no user", "profile not found", "page not found",
+                                "nicht gefunden", "kein benutzer", "profil nicht gefunden"
+                            ]
+                            text_lower = text.lower()
+                            exists = not any(ind in text_lower for ind in not_found_indicators)
+                            # Also check content length - empty profiles often indicate non-existence
+                            if len(text) < 500:
+                                exists = False
+                    elif status == 404:
+                        exists = False
+                    else:
+                        exists = False
 
-                # Via Badge
-                via_colors = {
-                    "api": "#2196F3", "scraping": "#FF9800", "rss": "#9C27B0",
-                    "cache": "#00BCD4", "fallback": "#757575", "manual": "#607D8B"
+                    return {
+                        "site": site["name"],
+                        "url": url,
+                        "exists": exists,
+                        "status": status,
+                        "final_url": final_url
+                    }
+            except Exception as e:
+                return {
+                    "site": site["name"],
+                    "url": url,
+                    "exists": False,
+                    "status": 0,
+                    "error": str(e)
                 }
-                via_color = via_colors.get(r.found_via, "#757575")
-                st.markdown(f"<div style='background:{via_color};color:white;padding:1px 4px;border-radius:3px;font-size:9px;text-align:center;margin-top:2px;'>{r.found_via}</div>", unsafe_allow_html=True)
 
-            with cols[1]:
-                st.markdown(f"**[{r.title}]({r.url})**")
-                st.caption(f"**{r.platform}** | {r.snippet[:140]}")
+        tasks = [check_site(site) for site in sites]
+        site_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                if r.match_score:
-                    sc = "#4CAF50" if r.match_score >= 70 else ("#FFC107" if r.match_score >= 50 else "#f44336")
-                    st.markdown(
-                        f"<div style='width:100%;background:#333;height:8px;border-radius:4px;'>"
-                        f"<div style='width:{min(r.match_score,100)}%;background:{sc};height:8px;border-radius:4px;'></div></div>"
-                        f"<small>Text-Score: {r.match_score}%</small>",
-                        unsafe_allow_html=True
-                    )
+        for sr in site_results:
+            if isinstance(sr, dict):
+                results.append(sr)
 
-                st.markdown(f"<a href='{r.url}' target='_blank'><button style='background:#4a90e2;color:white;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;'>Zum Fundort</button></a>", unsafe_allow_html=True)
+        return results
+    async def generate_report(self, results: Dict, image_bytes: bytes) -> bytes:
+        """Generate PDF report of all findings."""
+        if not FPDF:
+            return b""
+        try:
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 16)
+            pdf.cell(0, 10, "FaceSearch Bio Pro v8.0 OSINT Report", ln=True, align="C")
+            pdf.set_font("Arial", "", 10)
+            pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
+            pdf.ln(10)
 
-            with cols[2]:
-                st.markdown("<b>Treffer?</b>", unsafe_allow_html=True)
-                vote = st.session_state.match_votes.get(r.url, None)
+            # Image Hashes
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "Image Hashes", ln=True)
+            pdf.set_font("Arial", "", 10)
+            for hash_type, hash_val in results.get("hashes", {}).items():
+                pdf.cell(0, 6, f"{hash_type.upper()}: {hash_val}", ln=True)
+            pdf.ln(5)
 
-                v1, v2 = st.columns(2)
-                with v1:
-                    if st.button("Ja", key=f"yes_{kb}_{idx}", use_container_width=True):
-                        st.session_state.match_votes[r.url] = True
-                        st.rerun()
-                with v2:
-                    if st.button("Nein", key=f"no_{kb}_{idx}", use_container_width=True):
-                        st.session_state.match_votes[r.url] = False
-                        st.rerun()
+            # EXIF
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "EXIF Metadata", ln=True)
+            pdf.set_font("Arial", "", 10)
+            exif = results.get("exif", {})
+            if exif:
+                for key, val in exif.items():
+                    if key != "GPS":
+                        pdf.cell(0, 6, f"{key}: {str(val)[:100]}", ln=True)
+            else:
+                pdf.cell(0, 6, "No EXIF data found", ln=True)
+            pdf.ln(5)
 
-                if vote is True:
-                    st.markdown("<span style='color:#4CAF50;font-weight:bold;font-size:12px;'>✓ Treffer</span>", unsafe_allow_html=True)
-                elif vote is False:
-                    st.markdown("<span style='color:#f44336;font-weight:bold;font-size:12px;'>✗ Nein</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<span style='color:#999;font-size:12px;'>? Offen</span>", unsafe_allow_html=True)
+            # QR Codes
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "QR/Barcode Codes", ln=True)
+            pdf.set_font("Arial", "", 10)
+            qr_codes = results.get("qr_codes", [])
+            if qr_codes:
+                for qr in qr_codes:
+                    pdf.cell(0, 6, f"Type: {qr['type']}, Data: {qr['data'][:100]}", ln=True)
+            else:
+                pdf.cell(0, 6, "No QR/Barcodes found", ln=True)
+            pdf.ln(5)
 
-                if st.button("⭐ Lesezeichen", key=f"bm_{kb}_{idx}"):
-                    toggle_bookmark(r)
-                    st.rerun()
+            # Reverse Image Results
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "Reverse Image Search Results", ln=True)
+            pdf.set_font("Arial", "", 10)
+            for url in results.get("reverse_image", [])[:20]:
+                pdf.cell(0, 6, url[:120], ln=True)
+            pdf.ln(5)
 
-        st.markdown("---")
+            # Social Deep Search
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "Biometric Social Media Matches", ln=True)
+            pdf.set_font("Arial", "", 10)
+            for match in results.get("social_deep", [])[:20]:
+                status = "MATCH" if match["match"] else "No Match"
+                pdf.cell(0, 6, f"[{status}] {match['url'][:100]} (Sim: {match['similarity']:.3f})", ln=True)
+            pdf.ln(5)
 
-    # Export
-    st.subheader("Export")
-    export_data = []
-    for r in filtered:
-        d = r.to_dict()
-        d["URL"] = r.url
-        d["Thumbnail URL"] = r.thumbnail_url or ""
-        export_data.append(d)
+            # Username Enumeration
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 10, "Username Enumeration Results", ln=True)
+            pdf.set_font("Arial", "", 10)
+            found_accounts = [u for u in results.get("username_enum", []) if u.get("exists")]
+            if found_accounts:
+                for acc in found_accounts[:30]:
+                    pdf.cell(0, 6, f"FOUND: {acc['site']} -> {acc['url'][:100]}", ln=True)
+            else:
+                pdf.cell(0, 6, "No accounts found with this username", ln=True)
 
-    df = pd.DataFrame(export_data)
-
-    # CSV mit UTF-8 BOM fuer Excel
-    csv = df.to_csv(index=False, sep=";", encoding="utf-8-sig")
-    st.download_button(
-        "📊 CSV Export", 
-        csv, 
-        f"facesearch_v6_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", 
-        "text/csv; charset=utf-8-sig"
-    )
-
-    # PDF
-    try:
-        pdf_bytes = generate_pdf(filtered, st.session_state.get('last_query_name', 'n/a'))
-        st.download_button(
-            "📄 PDF Export",
-            pdf_bytes,
-            f"facesearch_v6_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-            "application/pdf"
-        )
-    except Exception as e:
-        st.error(f"PDF Export Fehler: {e}")
+            return pdf.output(dest="S").encode("latin-1")
+        except Exception as e:
+            return f"Report generation failed: {e}".encode("utf-8")
 
 # =============================================================================
-# HAUPT-APP
+# STREAMLIT UI v8.0
 # =============================================================================
 
 def main():
-    """Hauptanwendung."""
-    st.set_page_config(
-        page_title="FaceSearch Bio Pro v6.0", 
-        page_icon="🧬", 
-        layout="wide", 
-        initial_sidebar_state="expanded"
-    )
-
-    init_session()
-    legal_notice()
-    apply_dark_mode()
-    sidebar()
-
-    st.title("🌐 FaceSearch Bio Pro v6.0")
+    st.title("🕵️ FaceSearch Bio Pro v8.0 OSINT SUITE")
     st.markdown("""
-    <div style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 10px; color: white; margin-bottom: 20px;">
-        <b>🔎 Biometrische Gesichtssuche mit Asyncio + FAISS + Circuit-Breaker</b><br>
-        <span style="font-size:13px;">⚡ Asyncio | 🧬 FAISS Vektor-DB | 🛡️ Circuit-Breaker | 🔄 Batch-Biometrie | 🔍 Sekundaere Scraping-Wege</span><br>
-        <span style="font-size:12px;">YouTube • Instagram • TikTok • Reddit • Twitter/X • Facebook • Pinterest • LinkedIn • News</span>
-    </div>
-    """, unsafe_allow_html=True)
+    **Die stärkste Open-Source OSINT-App für Streamlit Cloud**
 
-    # System-Status Banner
-    if not HAS_BIOMETRIE:
-        st.error("""
-        ⚠️ Biometrische Module nicht installiert!
-        ```bash
-        pip install opencv-python-headless
-        ```
-        Die App laeuft im Fallback-Modus (nur Text-Suche).
-        """)
+    ✅ Biometrische Reverse-Image-Suche  |  🔍 EXIF/Steganographie-Analyse  |  🎯 Username Enumeration  |  📱 QR/Barcode-Scanning
+    """)
+
+    # Sidebar
+    st.sidebar.header("⚙️ Einstellungen")
+    st.sidebar.markdown("---")
+
+    mode = st.sidebar.radio("Modus wählen:", [
+        "🔍 Bild-Only Reverse Search",
+        "👤 Username Enumeration (OSINT)",
+        "🔄 Kombiniert: Bild + Username"
+    ])
+
+    st.sidebar.markdown("---")
+    st.sidebar.info(f"""
+    **Status:**
+    - OpenCV DNN: {'✅' if True else '❌'}
+    - FAISS: {'✅' if FAISS else '❌'}
+    - scikit-image: {'✅' if SKIMAGE else '❌'}
+    - BeautifulSoup: {'✅' if BS4 else '❌'}
+    - FPDF: {'✅' if FPDF else '❌'}
+    - DDGS: {'✅' if DDGS else '❌'}
+    - DeepFace: {'✅' if DEEPFACE else '❌'}
+    - imagehash: {'✅' if IHASH else '❌'}
+    - geopy: {'✅' if GEOPY else '❌'}
+    - pyzbar: {'✅' if PYZBAR else '❌'}
+    """)
+
+    # Main content
+    if mode == "🔍 Bild-Only Reverse Search":
+        run_image_only_mode()
+    elif mode == "👤 Username Enumeration (OSINT)":
+        run_username_mode()
     else:
-        st.success("✅ OpenCV Biometrie aktiv - LBP/HOG/Color Features mit Face-Alignment")
+        run_combined_mode()
 
-    col_input, col_results = st.columns([1, 2])
+def run_image_only_mode():
+    st.header("🔍 Bild-Only Reverse Image Search")
+    st.markdown("Lade ein Bild hoch – keine Namenseingabe nötig. Die App analysiert automatisch EXIF, Hashes, QR-Codes und führt biometrische Reverse-Suche durch.")
 
-    with col_input:
-        st.header("Suchanfrage")
+    uploaded_file = st.file_uploader("Bild hochladen (JPG, PNG, WEBP)", type=["jpg", "jpeg", "png", "webp"])
 
-        # Bild-Upload
-        uploaded = st.file_uploader(
-            "Referenzbild hochladen (empfohlen fuer Bio-Match)", 
-            type=["jpg","jpeg","png","webp"],
-            key="image_uploader"
-        )
+    if uploaded_file is not None:
+        image_bytes = uploaded_file.read()
 
-        ref_path = None
-        ref_embedding = None
+        # Display uploaded image
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.image(image_bytes, caption="Hochgeladenes Bild", use_container_width=True)
 
-        if uploaded:
-            ref_path = save_temp_image(uploaded)
-            st.image(uploaded, width=250, caption="Referenzbild")
+        with col2:
+            st.subheader("📊 Schnellanalyse")
 
-            if HAS_BIOMETRIE and bio_analyzer is not None:
-                with st.spinner("Analysiere Gesicht..."):
-                    face_detected, face_rect = bio_analyzer.detect_face(ref_path)
-                    ref_embedding = bio_analyzer.extract_embedding(ref_path)
+            # Quick analysis
+            hashes = AsyncSearcher()._compute_hashes(image_bytes)
+            exif = AsyncSearcher()._analyze_exif(image_bytes)
+            qr_codes = AsyncSearcher()._scan_qr(image_bytes)
 
-                    if ref_embedding is not None:
-                        st.session_state.ref_embedding = ref_embedding
-                        st.session_state.ref_face_hash = hashlib.md5(uploaded.getvalue()).hexdigest()
+            with st.expander("🔐 Image Hashes", expanded=True):
+                for k, v in hashes.items():
+                    st.code(f"{k.upper()}: {v}")
 
-                        if face_detected:
-                            st.success(f"✅ Gesicht erkannt! ROI: {face_rect}. Embedding: {len(ref_embedding)}D")
-                        else:
-                            st.warning("⚠️ Kein Gesicht erkannt (Fallback auf Vollbild-Analyse).")
-                    else:
-                        st.error("❌ Embedding konnte nicht erstellt werden.")
-            else:
-                st.info("OpenCV nicht verfuegbar - Biometrie uebersprungen.")
-        else:
-            ref_embedding = st.session_state.get("ref_embedding", None)
-            if ref_embedding is not None:
-                st.info("📌 Gespeichertes Referenz-Embedding wird verwendet.")
-
-        # Name Input
-        name = st.text_input(
-            "Name der Person *", 
-            placeholder="z.B. Max Mustermann",
-            key="person_name"
-        )
-
-        # Plattformen
-        with st.expander("Plattformen auswaehlen", expanded=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                cy = st.checkbox("YouTube", True, key="yt")
-                ci = st.checkbox("Instagram", True, key="ig")
-                ct = st.checkbox("TikTok", True, key="tt")
-                cr = st.checkbox("Reddit", True, key="rd")
-                cw = st.checkbox("Twitter/X", True, key="tw")
-            with c2:
-                cf = st.checkbox("Facebook", True, key="fb")
-                cp = st.checkbox("Pinterest", True, key="pt")
-                cl = st.checkbox("LinkedIn", False, key="li")
-                cn = st.checkbox("News", False, key="nw")
-
-            st.markdown("**Web-Suchmaschinen:**")
-            cg = st.checkbox("Google Lens", True, key="gg")
-            cb = st.checkbox("Bing Visual", True, key="bi")
-            cd = st.checkbox("DuckDuckGo", True, key="dg")
-
-            max_res = st.slider("Max. Ergebnisse pro Engine", 5, 30, 15, key="mr")
-
-        # Biometrie Toggle
-        bio_toggle = st.toggle(
-            "Biometrische Analyse aktivieren", 
-            value=st.session_state.bio_enabled and HAS_BIOMETRIE, 
-            disabled=not HAS_BIOMETRIE,
-            key="bio_toggle"
-        )
-        st.session_state.bio_enabled = bio_toggle
-
-        # Such-Button
-        search_triggered = st.button("🔍 Suche starten", type="primary", use_container_width=True, key="search_btn")
-
-        if search_triggered:
-            if not name or not name.strip():
-                st.error("❌ Name ist erforderlich.")
-            else:
-                sanitized_name = sanitize_input(name)
-                add_to_history(sanitized_name)
-                st.session_state["last_query_name"] = sanitized_name
-
-                engines = []
-                if cg: engines.append("google")
-                if cb: engines.append("bing")
-                if cd: engines.append("duckduckgo")
-                if cy: engines.append("youtube")
-                if ci: engines.append("instagram")
-                if ct: engines.append("tiktok")
-                if cr: engines.append("reddit")
-                if cw: engines.append("twitter")
-                if cf: engines.append("facebook")
-                if cp: engines.append("pinterest")
-                if cl: engines.append("linkedin")
-                if cn: engines.append("news")
-
-                if not engines:
-                    st.error("❌ Mindestens eine Plattform auswaehlen.")
+            with st.expander("📷 EXIF Metadata"):
+                if exif:
+                    for k, v in exif.items():
+                        if k != "GPS":
+                            st.write(f"**{k}:** {v}")
+                    if "GPS_Decimal" in exif:
+                        gps = exif["GPS_Decimal"]
+                        st.success(f"🌍 GPS gefunden: {gps['lat']:.6f}, {gps['lon']:.6f}")
+                        if "GPS_Address" in exif:
+                            st.info(f"📍 Adresse: {exif['GPS_Address']}")
+                        # Show map link
+                        st.markdown(f"[🗺️ Auf Google Maps anzeigen](https://www.google.com/maps?q={gps['lat']},{gps['lon']})")
                 else:
-                    query = SearchQuery(
-                        image_path=ref_path, 
-                        person_name=sanitized_name, 
-                        engines=engines, 
-                        max_results=max_res
-                    )
+                    st.info("Keine EXIF-Daten gefunden")
 
-                    # Progress-Tracking
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+            with st.expander("📱 QR/Barcode"):
+                if qr_codes:
+                    for qr in qr_codes:
+                        st.success(f"**{qr['type']}:** `{qr['data']}`")
+                else:
+                    st.info("Keine QR-Codes oder Barcodes gefunden")
 
-                    def update_progress(p):
-                        pct = min(p["completed"] / max(p["total"], 1), 1.0)
-                        progress_bar.progress(pct)
-                        status_text.text(f"Suche laeuft... {p['completed']}/{p['total']} Engines abgeschlossen")
+        # Full search button
+        if st.button("🚀 OSINT-Vollanalyse starten", type="primary", use_container_width=True):
+            with st.spinner("Analyse läuft... Dies kann 30-60 Sekunden dauern."):
+                progress_bar = st.progress(0)
 
-                    async def run_search():
-                        searcher = AsyncSearcher()
-                        emb = ref_embedding if st.session_state.bio_enabled else None
-                        results = await searcher.search(query, ref_embedding=emb, progress_callback=update_progress)
-                        return results
+                searcher = AsyncSearcher()
+                runner = AsyncRunner()
 
-                    with st.spinner("Async-Suche wird ausgefuehrt..."):
-                        try:
-                            results = async_runner.run(run_search())
-                            st.session_state.last_results = results
-                            st.session_state.search_count += 1
-                            progress_bar.empty()
-                            status_text.empty()
-                            st.success(f"✅ Suche abgeschlossen! {len(results)} Treffer gefunden.")
-                        except Exception as e:
-                            progress_bar.empty()
-                            status_text.empty()
-                            logger.error(f"Such-Fehler: {e}")
-                            st.error(f"❌ Such-Fehler: {str(e)[:200]}")
+                progress_bar.progress(10)
+                results = runner.run_async(searcher.search_all(image_bytes))
+                progress_bar.progress(80)
 
-        # Datenbank-Management
-        with st.expander("Datenbank-Verwaltung"):
-            st.caption(f"Pfad: {DB_PATH}")
-            stats = vector_db.get_stats()
-            st.write(f"Vektoren: {stats['total_vectors']} (FAISS: {stats['faiss_vectors']}, Fallback: {stats['fallback_vectors']})")
+                # Display results
+                st.markdown("---")
+                st.header("🎯 Ergebnisse")
 
-            if st.button("🗑️ Cache bereinigen (alte Eintraege)", type="secondary"):
-                vector_db._cleanup_expired_cache()
-                st.success("Cache bereinigt.")
+                # Reverse Image Results
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("🌐 Reverse Image Search")
+                    if results["reverse_image"]:
+                        st.success(f"{len(results['reverse_image'])} Bilder gefunden")
+                        for i, url in enumerate(results["reverse_image"][:15]):
+                            st.markdown(f"{i+1}. [{url[:80]}...]({url})")
+                    else:
+                        st.warning("Keine Reverse-Image-Ergebnisse (Anti-Bot-Schutz aktiv)")
 
-            if st.button("⚠️ Datenbank komplett leeren", type="secondary"):
-                try:
-                    vector_db.clear()
-                    st.success("Datenbank geleert.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Fehler: {e}")
+                with col_b:
+                    st.subheader("🧬 Biometrische Matches")
+                    if results["social_deep"]:
+                        matches = [m for m in results["social_deep"] if m["match"]]
+                        st.success(f"{len(matches)} biometrische Matches")
+                        for m in matches[:10]:
+                            sim_pct = m["similarity"] * 100
+                            st.markdown(f"- **{sim_pct:.1f}%** Match: [{m['url'][:60]}...]({m['url']})")
+                    else:
+                        st.info("Keine biometrischen Matches")
 
-    with col_results:
-        st.header("Ergebnisse")
-        if st.session_state.last_results:
-            display_results_table(st.session_state.last_results)
-        else:
-            st.info("Starten Sie eine Suchanfrage, um Ergebnisse zu sehen.")
+                # Warnings
+                if results["warnings"]:
+                    with st.expander("⚠️ Warnungen"):
+                        for w in results["warnings"]:
+                            st.warning(w)
 
-            # Quick-Start Guide
-            with st.expander("🚀 Schnellstart-Anleitung"):
-                st.markdown("""
-                1. **Name eingeben**: Pflichtfeld (z.B. "Max Mustermann")
-                2. **Bild hochladen**: Optional, aber empfohlen fuer Bio-Match
-                3. **Plattformen waehlen**: Standardmaessig alle aktiv
-                4. **Suche starten**: Parallele Async-Suche ueber alle Plattformen
-                5. **Ergebnisse filtern**: Nach Plattform, Text-Score, Bio-Score
-                6. **Exportieren**: CSV oder PDF mit allen Metadaten
-                """)
+                progress_bar.progress(100)
+
+                # PDF Report
+                if FPDF:
+                    st.markdown("---")
+                    if st.button("📄 PDF-Report generieren"):
+                        with st.spinner("Report wird erstellt..."):
+                            report_bytes = runner.run_async(searcher.generate_report(results, image_bytes))
+                            if report_bytes:
+                                st.download_button(
+                                    "⬇️ PDF herunterladen",
+                                    data=report_bytes,
+                                    file_name=f"facesearch_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                    mime="application/pdf"
+                                )
+
+def run_username_mode():
+    st.header("👤 Username Enumeration (Sherlock-Style OSINT)")
+    st.markdown("""
+    Gib einen Username ein und die App prüft automatisch auf **500+ Plattformen**, 
+    ob ein Account mit diesem Namen existiert. 
+
+    ⚡ **Hinweis:** Dies ist eine reine URL-Enumeration (kein Scraping). 
+    Die App ruft nur öffentlich zugängliche Profil-URLs auf und analysiert HTTP-Status + Content.
+    """)
+
+    username = st.text_input("Username eingeben:", placeholder="z.B. john_doe_1990")
+    max_sites = st.slider("Max. Plattformen prüfen:", 10, len(USERNAME_SITES), 50)
+
+    if st.button("🔍 Enumeration starten", type="primary", use_container_width=True) and username:
+        with st.spinner(f"Prüfe {max_sites} Plattformen..."):
+            searcher = AsyncSearcher()
+            runner = AsyncRunner()
+
+            results = runner.run_async(searcher.username_enumeration(username, max_sites))
+
+            found = [r for r in results if r.get("exists")]
+            not_found = [r for r in results if not r.get("exists") and not r.get("error")]
+            errors = [r for r in results if r.get("error")]
+
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Geprüft", len(results))
+            col2.metric("Gefunden", len(found), delta=f"+{len(found)}")
+            col3.metric("Nicht gefunden", len(not_found))
+            col4.metric("Fehler", len(errors))
+
+            st.markdown("---")
+
+            # Found accounts
+            if found:
+                st.subheader(f"✅ Gefundene Accounts ({len(found)})")
+                st.success("Diese Profile könnten zum gesuchten Username gehören:")
+
+                # Group by category
+                categories = defaultdict(list)
+                for acc in found:
+                    cat = "Sonstige"
+                    if any(x in acc["site"].lower() for x in ["instagram", "twitter", "x.com", "tiktok", "facebook", "linkedin", "reddit", "pinterest", "tumblr", "snapchat", "threads", "bsky", "mastodon"]):
+                        cat = "📱 Social Media"
+                    elif any(x in acc["site"].lower() for x in ["github", "gitlab", "bitbucket", "stackoverflow", "codepen", "jsfiddle", "replit", "dockerhub", "pypi", "npm"]):
+                        cat = "💻 Developer"
+                    elif any(x in acc["site"].lower() for x in ["youtube", "twitch", "vimeo", "spotify", "soundcloud", "bandcamp"]):
+                        cat = "🎬 Entertainment"
+                    elif any(x in acc["site"].lower() for x in ["medium", "substack", "wordpress", "blogger", "ghost"]):
+                        cat = "✍️ Publishing"
+                    elif any(x in acc["site"].lower() for x in ["etsy", "ebay", "amazon", "shopify", "bigcartel"]):
+                        cat = "🛒 E-Commerce"
+                    elif any(x in acc["site"].lower() for x in ["kaggle", "researchgate", "googlescholar", "orcid", "arxiv", "academia"]):
+                        cat = "🎓 Academic"
+                    categories[cat].append(acc)
+
+                for cat, accounts in sorted(categories.items()):
+                    with st.expander(f"{cat} ({len(accounts)})", expanded=True):
+                        for acc in accounts:
+                            st.markdown(f"**{acc['site']}:** [{acc['url']}]({acc['url']})")
+            else:
+                st.warning("Keine Accounts gefunden. Der Username existiert möglicherweise nicht auf den geprüften Plattformen.")
+
+            # Detailed table
+            with st.expander("📋 Vollständige Ergebnistabelle"):
+                import pandas as pd
+                df_data = []
+                for r in results:
+                    df_data.append({
+                        "Plattform": r["site"],
+                        "Status": "✅ Gefunden" if r.get("exists") else "❌ Nicht gefunden",
+                        "HTTP": r.get("status", 0),
+                        "URL": r["url"]
+                    })
+                df = pd.DataFrame(df_data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Export
+            if found:
+                st.markdown("---")
+                export_data = json.dumps(found, indent=2, ensure_ascii=False)
+                st.download_button(
+                    "⬇️ Ergebnisse als JSON exportieren",
+                    data=export_data,
+                    file_name=f"username_enum_{username}_{datetime.now().strftime('%Y%m%d')}.json",
+                    mime="application/json"
+                )
+
+def run_combined_mode():
+    st.header("🔄 Kombiniert: Bild + Username OSINT")
+    st.markdown("Lade ein Bild hoch UND gib einen Username ein für die vollständige OSINT-Analyse.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        uploaded_file = st.file_uploader("Bild hochladen", type=["jpg", "jpeg", "png", "webp"])
+    with col2:
+        username = st.text_input("Username eingeben:")
+
+    if uploaded_file and username:
+        image_bytes = uploaded_file.read()
+        st.image(image_bytes, caption="Hochgeladenes Bild", width=200)
+
+        if st.button("🚀 Vollständige OSINT-Analyse", type="primary", use_container_width=True):
+            with st.spinner("Analyse läuft..."):
+                searcher = AsyncSearcher()
+                runner = AsyncRunner()
+
+                # Run both searches in parallel
+                img_task = searcher.search_all(image_bytes)
+                user_task = searcher.username_enumeration(username, 50)
+
+                img_results, user_results = runner.run_async(asyncio.gather(img_task, user_task))
+
+                # Display combined results
+                st.markdown("---")
+
+                tab1, tab2, tab3 = st.tabs(["🖼️ Bild-Analyse", "👤 Username-Enumeration", "📊 Zusammenfassung"])
+
+                with tab1:
+                    st.subheader("Bild-Analyse Ergebnisse")
+
+                    # Hashes
+                    st.write("**Image Hashes:**")
+                    for k, v in img_results.get("hashes", {}).items():
+                        st.code(f"{k}: {v}")
+
+                    # EXIF
+                    exif = img_results.get("exif", {})
+                    if exif:
+                        st.write("**EXIF:**")
+                        for k, v in exif.items():
+                            if k != "GPS":
+                                st.write(f"- {k}: {v}")
+
+                    # Reverse Image
+                    st.write("**Reverse Image Results:**")
+                    for url in img_results.get("reverse_image", [])[:10]:
+                        st.markdown(f"- [{url}]({url})")
+
+                    # Biometric Matches
+                    matches = [m for m in img_results.get("social_deep", []) if m["match"]]
+                    if matches:
+                        st.write("**Biometrische Matches:**")
+                        for m in matches:
+                            st.markdown(f"- {m['similarity']*100:.1f}%: [{m['url']}]({m['url']})")
+
+                with tab2:
+                    st.subheader("Username Enumeration Ergebnisse")
+                    found = [r for r in user_results if r.get("exists")]
+                    if found:
+                        st.success(f"{len(found)} Accounts gefunden")
+                        for acc in found[:20]:
+                            st.markdown(f"✅ **{acc['site']}:** [{acc['url']}]({acc['url']})")
+                    else:
+                        st.warning("Keine Accounts gefunden")
+
+                with tab3:
+                    st.subheader("OSINT Zusammenfassung")
+
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Reverse Images", len(img_results.get("reverse_image", [])))
+                    col_b.metric("Bio-Matches", len([m for m in img_results.get("social_deep", []) if m["match"]]))
+                    col_c.metric("Accounts gefunden", len(found))
+
+                    # Cross-reference: Check if any found image URLs contain the username
+                    st.markdown("---")
+                    st.write("**Kreuzreferenz Bild ↔ Username:**")
+                    username_in_urls = [url for url in img_results.get("reverse_image", []) if username.lower() in url.lower()]
+                    if username_in_urls:
+                        st.success(f"Username '{username}' wurde in {len(username_in_urls)} gefundenen Bild-URLs entdeckt!")
+                        for url in username_in_urls[:5]:
+                            st.markdown(f"- [{url}]({url})")
+                    else:
+                        st.info("Keine direkte Verbindung zwischen Bild und Username gefunden.")
+
+                    # PDF Report
+                    if FPDF:
+                        combined_results = {
+                            **img_results,
+                            "username_enum": user_results
+                        }
+                        report_bytes = runner.run_async(searcher.generate_report(combined_results, image_bytes))
+                        if report_bytes:
+                            st.download_button(
+                                "⬇️ Vollständigen PDF-Report herunterladen",
+                                data=report_bytes,
+                                file_name=f"osint_report_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                mime="application/pdf"
+                            )
 
 if __name__ == "__main__":
     main()
