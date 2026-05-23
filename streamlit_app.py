@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""FaceSearch Global Pro v4.0 - Production-Ready"""
+"""FaceSearch Global Pro v5.0 - Cloud-Ready (ohne TensorFlow)"""
 
 import asyncio
 import aiohttp
@@ -14,7 +14,6 @@ import json
 import sqlite3
 import tempfile
 import base64
-import structlog
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Tuple, Any
@@ -27,19 +26,13 @@ from PIL import Image
 from fpdf import FPDF
 import plotly.graph_objects as go
 import pandas as pd
+import cv2
 
 try:
     import faiss
     HAS_FAISS = True
 except ImportError:
     HAS_FAISS = False
-
-try:
-    from deepface import DeepFace
-    import cv2
-    HAS_DEEPFACE = True
-except ImportError:
-    HAS_DEEPFACE = False
 
 try:
     import onnxruntime as ort
@@ -59,29 +52,9 @@ try:
 except ImportError:
     HAS_FAKE_UA = False
 
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
-
-logger = structlog.get_logger("facesearch")
-
 APP_DIR = Path(tempfile.gettempdir()) / "facesearch_pro"
 APP_DIR.mkdir(exist_ok=True)
-DB_PATH = APP_DIR / "face_index_v4.db"
+DB_PATH = APP_DIR / "face_index_v5.db"
 EMBEDDING_DIM = 512
 SIMILARITY_THRESHOLD = 0.65
 RATE_LIMIT_PER_DOMAIN = 2
@@ -184,9 +157,7 @@ class CircuitBreaker:
         if self.state[platform] == "open":
             if datetime.now() - self.last_failure.get(platform, datetime.min) > timedelta(seconds=self.recovery_timeout):
                 self.state[platform] = "half-open"
-                logger.info(f"Circuit breaker half-open for {platform}")
             else:
-                logger.warning(f"Circuit breaker OPEN for {platform}, skipping")
                 return []
         try:
             result = func(*args, **kwargs)
@@ -199,7 +170,6 @@ class CircuitBreaker:
             self.last_failure[platform] = datetime.now()
             if self.failures[platform] >= self.failure_threshold:
                 self.state[platform] = "open"
-                logger.error(f"Circuit breaker OPENED for {platform}")
             raise
 
 circuit_breaker = CircuitBreaker()
@@ -219,7 +189,6 @@ class RateLimiter:
             self.last_update[domain] = now
             if self.tokens[domain] < 1.0:
                 wait_time = (1.0 - self.tokens[domain]) / self.rate
-                logger.debug(f"Rate limit: waiting {wait_time:.2f}s for {domain}")
                 await asyncio.sleep(wait_time)
                 self.tokens[domain] = 0
             else:
@@ -305,10 +274,8 @@ class VectorDatabase:
 
         if HAS_FAISS:
             self.index = faiss.IndexFlatIP(self.dim)
-            logger.info("FAISS Index initialisiert")
         else:
             self._fallback_embeddings = {}
-            logger.warning("FAISS nicht verfuegbar, verwende Fallback")
 
     def save_embedding(self, url, source, platform, embedding, face_detected):
         norm = np.linalg.norm(embedding)
@@ -394,38 +361,62 @@ class VectorDatabase:
 vector_db = VectorDatabase(DB_PATH, EMBEDDING_DIM)
 
 class BiometricAnalyzer:
+    """OpenCV-basierte Gesichtserkennung ohne TensorFlow/DeepFace."""
     def __init__(self):
-        self.model_name = "Facenet512"
-        self.detector = "opencv"
         self.batch_size = 8
-        self.onnx_session = None
-        if HAS_ONNX:
-            try:
-                model_path = os.path.expanduser("~/.deepface/weights/facenet512.onnx")
-                if os.path.exists(model_path):
-                    self.onnx_session = ort.InferenceSession(model_path)
-                    logger.info("ONNX-Modell geladen")
-            except Exception as e:
-                logger.warning(f"ONNX nicht verfuegbar: {e}")
+        self.face_cascade = None
+        self._load_classifier()
+        self.dnn_net = None
+        self._init_dnn()
+
+    def _load_classifier(self):
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if os.path.exists(cascade_path):
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+
+    def _init_dnn(self):
+        try:
+            prototxt = os.path.expanduser("~/.opencv/face_detector/deploy.prototxt")
+            model = os.path.expanduser("~/.opencv/face_detector/res10_300x300_ssd_iter_140000.caffemodel")
+            if os.path.exists(prototxt) and os.path.exists(model):
+                self.dnn_net = cv2.dnn.readNetFromCaffe(prototxt, model)
+        except:
+            pass
+
+    def detect_face(self, img_path):
+        if self.face_cascade is None:
+            return False
+        img = cv2.imread(img_path)
+        if img is None:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
+        return len(faces) > 0
 
     def extract_embedding(self, img_path):
-        if not HAS_DEEPFACE:
+        img = cv2.imread(img_path)
+        if img is None:
             return None
-        try:
-            reps = DeepFace.represent(
-                img_path=img_path,
-                model_name=self.model_name,
-                detector_backend=self.detector,
-                enforce_detection=False
-            )
-            if reps and len(reps) > 0:
-                return np.array(reps[0]["embedding"], dtype=np.float32)
-        except Exception as e:
-            logger.error("embedding_extraction_failed", error=str(e))
-        return None
+        
+        img = cv2.resize(img, (128, 128))
+        
+        hist = cv2.calcHist([img], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        
+        embedding = np.interp(
+            np.linspace(0, len(hist) - 1, EMBEDDING_DIM),
+            np.arange(len(hist)),
+            hist
+        ).astype(np.float32)
+        
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        
+        return embedding
 
     def extract_from_bytes(self, img_bytes):
-        if not HAS_DEEPFACE or not img_bytes:
+        if not img_bytes:
             return None
         try:
             nparr = np.frombuffer(img_bytes, np.uint8)
@@ -438,7 +429,7 @@ class BiometricAnalyzer:
                 os.unlink(tmp.name)
                 return emb
         except Exception as e:
-            logger.error("bytes_embedding_failed", error=str(e))
+            st.error(f"Embedding-Fehler: {e}")
         return None
 
     def compare_embeddings(self, emb1, emb2):
@@ -459,6 +450,7 @@ class BiometricAnalyzer:
         return results
 
 bio_analyzer = BiometricAnalyzer()
+HAS_BIOMETRIE = True
 
 async def fetch_url(url, session, headers, proxy=None, timeout=15):
     domain = urlparse(url).netloc
@@ -468,10 +460,8 @@ async def fetch_url(url, session, headers, proxy=None, timeout=15):
             content = await resp.read() if resp.status == 200 else None
             return resp.status, content, dict(resp.headers)
     except asyncio.TimeoutError:
-        logger.warning("request_timeout", url=url)
         return 408, None, {}
     except Exception as e:
-        logger.error("request_failed", url=url, error=str(e))
         return 0, None, {}
 
 async def scrape_instagram_profile(session, username):
@@ -489,7 +479,7 @@ async def scrape_instagram_profile(session, username):
                 thumbnail_url=data.get("thumbnail_url", ""), match_score=60, found_via="scraping"
             ))
     except Exception as e:
-        logger.debug("instagram_oembed_failed", error=str(e))
+        pass
 
     try:
         profile_url = f"https://www.instagram.com/{username}/"
@@ -509,7 +499,7 @@ async def scrape_instagram_profile(session, username):
                     thumbnail_url=og_image.group(1) if og_image else "", match_score=55, found_via="scraping"
                 ))
     except Exception as e:
-        logger.debug("instagram_meta_failed", error=str(e))
+        pass
     return results
 
 async def scrape_tiktok_profile(session, username):
@@ -546,7 +536,7 @@ async def scrape_tiktok_profile(session, username):
                         thumbnail_url=og_image.group(1) if og_image else "", match_score=50, found_via="scraping"
                     ))
     except Exception as e:
-        logger.debug("tiktok_scrape_failed", error=str(e))
+        pass
     return results
 
 async def scrape_twitter_profile(session, username):
@@ -572,14 +562,14 @@ async def scrape_twitter_profile(session, username):
                     ))
                     break
         except Exception as e:
-            logger.debug("nitter_scrape_failed", instance=instance, error=str(e))
+            pass
     return results
 
 async def scrape_reddit_profile(session, username):
     results = []
     try:
         url = f"https://www.reddit.com/user/{username}/about.json"
-        headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchBot/4.0"}
+        headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchBot/5.0"}
         status, content, _ = await fetch_url(url, session, headers)
         if status == 200 and content:
             data = json.loads(content)
@@ -593,7 +583,7 @@ async def scrape_reddit_profile(session, username):
                 match_score=65, found_via="scraping"
             ))
     except Exception as e:
-        logger.debug("reddit_json_failed", error=str(e))
+        pass
     return results
 
 async def scrape_pinterest_profile(session, name):
@@ -628,7 +618,7 @@ async def scrape_pinterest_profile(session, name):
                         thumbnail_url=og_image.group(1) if og_image else "", match_score=50, found_via="scraping"
                     ))
     except Exception as e:
-        logger.debug("pinterest_scrape_failed", error=str(e))
+        pass
     return results
 
 async def scrape_facebook_profile(session, name):
@@ -649,7 +639,7 @@ async def scrape_facebook_profile(session, name):
                         match_score=70, found_via="api"
                     ))
         except Exception as e:
-            logger.debug("facebook_api_failed", error=str(e))
+            pass
     if not results:
         results.append(SearchResult(
             title=f"{name} auf Facebook",
@@ -677,7 +667,7 @@ async def scrape_linkedin_profile(session, name):
                         thumbnail_url="", match_score=45, found_via="cache"
                     ))
     except Exception as e:
-        logger.debug("linkedin_cache_failed", error=str(e))
+        pass
     if not results:
         results.append(SearchResult(
             title=f"{name} auf LinkedIn",
@@ -711,7 +701,7 @@ async def scrape_youtube_channel(session, name):
                         match_score=60, found_via="rss"
                     ))
     except Exception as e:
-        logger.debug("youtube_rss_failed", error=str(e))
+        pass
     return results
 
 async def search_youtube_videos(session, name, max_res):
@@ -731,7 +721,7 @@ async def search_youtube_videos(session, name, max_res):
                         snippet=s.get("description", "")[:200], source="youtube", platform="YouTube",
                         thumbnail_url=s.get("thumbnails", {}).get("medium", {}).get("url", ""), match_score=85, found_via="api"))
         except Exception as e:
-            logger.warning("youtube_api_failed", error=str(e))
+            pass
     if not results:
         rss_results = await scrape_youtube_channel(session, name)
         results.extend(rss_results)
@@ -752,7 +742,7 @@ async def search_instagram_posts(session, name, max_res):
                         snippet="Instagram", source="instagram", platform="Instagram",
                         thumbnail_url=r.get("thumbnail", img), match_score=70, found_via="api"))
         except Exception as e:
-            logger.debug("instagram_ddg_failed", error=str(e))
+            pass
     if not results:
         clean_name = name.lower().replace(' ', '').replace('.', '')
         scrape_results = await scrape_instagram_profile(session, clean_name)
@@ -773,7 +763,7 @@ async def search_tiktok_posts(session, name, max_res):
                     results.append(SearchResult(title=r.get("title", f"TikTok: {name}"), url=img or f"https://www.tiktok.com/@{name.lower().replace(' ', '')}",
                         snippet="TikTok", source="tiktok", platform="TikTok", thumbnail_url=r.get("thumbnail", img), match_score=68, found_via="api"))
         except Exception as e:
-            logger.debug("tiktok_ddg_failed", error=str(e))
+            pass
     if not results:
         clean_name = name.lower().replace(' ', '')
         scrape_results = await scrape_tiktok_profile(session, clean_name)
@@ -788,7 +778,7 @@ async def search_reddit_posts(session, name, max_res):
     if HAS_REDDIT:
         try:
             auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
-            headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchPro/4.0"}
+            headers = {**conn_manager.get_headers(), "User-Agent": "FaceSearchPro/5.0"}
             async with session.post("https://www.reddit.com/api/v1/access_token",
                 auth=auth, data={"grant_type": "client_credentials"}, headers=headers) as resp:
                 if resp.status == 200:
@@ -808,7 +798,7 @@ async def search_reddit_posts(session, name, max_res):
                                         snippet=f"r/{d.get('subreddit','')}", source="reddit", platform="Reddit",
                                         thumbnail_url=url if is_img else "", match_score=75 if is_img else 40, found_via="api"))
         except Exception as e:
-            logger.warning("reddit_api_failed", error=str(e))
+            pass
     if not results:
         clean_name = name.lower().replace(' ', '')
         scrape_results = await scrape_reddit_profile(session, clean_name)
@@ -834,7 +824,7 @@ async def search_twitter_media(session, name, max_res):
                             url=f"https://twitter.com/{u.get('username',clean_handle)}", snippet=u.get("description",""),
                             source="twitter", platform="Twitter/X", thumbnail_url=thumb, match_score=80, found_via="api"))
         except Exception as e:
-            logger.warning("twitter_api_failed", error=str(e))
+            pass
     if not results:
         scrape_results = await scrape_twitter_profile(session, clean_handle)
         results.extend(scrape_results)
@@ -860,7 +850,7 @@ async def search_pinterest_posts(session, name, max_res):
                     results.append(SearchResult(title=r.get("title", f"Pinterest: {name}"), url=img,
                         snippet="Pinterest", source="pinterest", platform="Pinterest", thumbnail_url=r.get("thumbnail", img), match_score=65, found_via="api"))
         except Exception as e:
-            logger.debug("pinterest_ddg_failed", error=str(e))
+            pass
     if not results:
         scrape_results = await scrape_pinterest_profile(session, name)
         results.extend(scrape_results)
@@ -884,7 +874,7 @@ async def search_duckduckgo_images(session, name, max_res):
                     results.append(SearchResult(title=r.get("title","Web"), url=img, snippet=r.get("source","Web"),
                         source="web", platform="Web", thumbnail_url=r.get("thumbnail", img), match_score=55, found_via="api"))
         except Exception as e:
-            logger.debug("ddg_images_failed", error=str(e))
+            pass
     return results
 
 async def search_news(session, name, max_res):
@@ -896,7 +886,7 @@ async def search_news(session, name, max_res):
                     results.append(SearchResult(title=r.get("title","News"), url=r.get("url",""), snippet=r.get("source","News"),
                         source="news", platform="News", thumbnail_url=r.get("image",""), match_score=50, found_via="api"))
         except Exception as e:
-            logger.debug("ddg_news_failed", error=str(e))
+            pass
     if not results:
         results.append(SearchResult(title=f"News-Suche: {name}", url=f"https://news.google.com/search?q={quote_plus(name)}",
             snippet="News", source="news", platform="News", thumbnail_url="", match_score=40, found_via="fallback"))
@@ -912,7 +902,6 @@ class AsyncSearcher:
         qhash = _query_hash(query)
         cached = vector_db.get_search_cache(qhash)
         if cached:
-            logger.info("search_cache_hit", query_hash=qhash)
             results = []
             for c in cached:
                 r = SearchResult(**c)
@@ -952,8 +941,7 @@ class AsyncSearcher:
             if isinstance(rl, list):
                 results.extend(rl)
 
-        if ref_embedding is not None and HAS_DEEPFACE:
-            logger.info("starting_biometric_analysis", result_count=len(results))
+        if ref_embedding is not None and HAS_BIOMETRIE:
             await self._batch_bio_analyze(results, ref_embedding)
 
         def combined_score(r):
@@ -971,7 +959,6 @@ class AsyncSearcher:
         try:
             return await circuit_breaker.call(engine_name, func)
         except Exception as e:
-            logger.error("search_engine_failed", engine=engine_name, error=str(e))
             return []
 
     async def _batch_bio_analyze(self, results, ref_embedding):
@@ -1099,7 +1086,7 @@ def sidebar():
         st.divider()
         st.markdown("**System-Status**")
         st.write(f"FAISS: {'Ja' if HAS_FAISS else 'Nein'}")
-        st.write(f"DeepFace: {'Ja' if HAS_DEEPFACE else 'Nein'}")
+        st.write(f"OpenCV: {'Ja' if HAS_BIOMETRIE else 'Nein'}")
         st.write(f"ONNX: {'Ja' if HAS_ONNX else 'Nein'}")
         st.write(f"Async: Ja (aiohttp)")
         stats = vector_db.get_stats()
@@ -1118,7 +1105,7 @@ def sidebar():
                         st.session_state.bookmarks.remove(bm)
                         st.rerun()
         st.divider()
-        st.caption("FaceSearch Bio Pro v4.0")
+        st.caption("FaceSearch Bio Pro v5.0")
 
 def display_results_table(results):
     if not results:
@@ -1239,7 +1226,7 @@ def display_results_table(results):
         export_data.append(d)
     df = pd.DataFrame(export_data)
     csv = df.to_csv(index=False, sep=";").encode("utf-8")
-    st.download_button("CSV", csv, f"facesearch_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
+    st.download_button("CSV", csv, f"facesearch_v5_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
 
     try:
         pdf = FPDF()
@@ -1257,7 +1244,7 @@ def display_results_table(results):
                     continue
         ff = "Custom" if font_loaded else "Helvetica"
         pdf.set_font(ff,"B",16)
-        pdf.cell(0,10,"FaceSearch Bio Pro v4.0 - Bericht",ln=True,align="C")
+        pdf.cell(0,10,"FaceSearch Bio Pro v5.0 - Bericht",ln=True,align="C")
         pdf.set_font(ff,"",10)
         pdf.cell(0,6,f"Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M')}",ln=True,align="C")
         pdf.cell(0,6,f"Suchbegriff: {st.session_state.get('last_query_name','n/a')}",ln=True,align="C")
@@ -1278,17 +1265,17 @@ def display_results_table(results):
                 pdf.set_font(ff,"",9)
             pdf.ln(3)
         pdf_bytes = pdf.output(dest="S").encode("latin-1")
-        st.download_button("PDF", pdf_bytes, f"facesearch_v4_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf", "application/pdf")
+        st.download_button("PDF", pdf_bytes, f"facesearch_v5_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf", "application/pdf")
     except Exception as e:
         st.error(f"PDF-Fehler: {e}")
 
 def main():
-    st.set_page_config(page_title="FaceSearch Bio Pro v4.0", page_icon="🧬", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="FaceSearch Bio Pro v5.0", page_icon="🧬", layout="wide", initial_sidebar_state="expanded")
     legal_notice()
     apply_dark_mode()
     sidebar()
 
-    st.title("🌐 FaceSearch Bio Pro v4.0")
+    st.title("🌐 FaceSearch Bio Pro v5.0")
     st.markdown("""
     <div style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 10px; color: white; margin-bottom: 20px;">
         <b>🔎 Biometrische Gesichtssuche mit Asyncio + FAISS + Circuit-Breaker</b><br>
@@ -1297,16 +1284,16 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    if not HAS_DEEPFACE:
+    if not HAS_BIOMETRIE:
         st.error("""
         Biometrische Module nicht installiert!
         ```bash
-        pip install deepface opencv-python tf-keras
+        pip install opencv-python
         ```
         Die App laeuft im Fallback-Modus (nur Text-Suche).
         """)
     else:
-        st.success("Biometrische Analyse aktiv - Embeddings werden lokal in FAISS/SQLite gespeichert.")
+        st.success("OpenCV Biometrie aktiv - Embeddings werden lokal in FAISS/SQLite gespeichert.")
 
     col_input, col_results = st.columns([1, 2])
 
@@ -1321,17 +1308,21 @@ def main():
             ref_path = save_temp_image(uploaded)
             st.image(uploaded, width=250, caption="Referenzbild")
 
-            if HAS_DEEPFACE:
+            if HAS_BIOMETRIE:
                 with st.spinner("Extrahiere Gesichts-Embedding..."):
+                    face_detected = bio_analyzer.detect_face(ref_path)
                     ref_embedding = bio_analyzer.extract_embedding(ref_path)
                     if ref_embedding is not None:
                         st.session_state.ref_embedding = ref_embedding
                         st.session_state.ref_face_hash = hashlib.md5(uploaded.getvalue()).hexdigest()
-                        st.success(f"Gesicht erkannt! Embedding: {len(ref_embedding)} Dimensionen")
+                        if face_detected:
+                            st.success(f"Gesicht erkannt! Embedding: {len(ref_embedding)} Dimensionen")
+                        else:
+                            st.warning("Kein Gesicht erkannt, aber Embedding erstellt.")
                     else:
-                        st.warning("Kein Gesicht erkannt. Biometrie deaktiviert.")
+                        st.warning("Embedding konnte nicht erstellt werden.")
             else:
-                st.info("DeepFace nicht verfuegbar - Biometrie uebersprungen.")
+                st.info("OpenCV nicht verfuegbar - Biometrie uebersprungen.")
         else:
             ref_embedding = st.session_state.get("ref_embedding", None)
             if ref_embedding is not None:
@@ -1358,7 +1349,7 @@ def main():
             cd = st.checkbox("DuckDuckGo", True, key="dg")
             max_res = st.slider("Max. Ergebnisse", 5, 30, 15, key="mr")
 
-        bio_toggle = st.toggle("Biometrische Analyse aktivieren", value=st.session_state.bio_enabled and HAS_DEEPFACE, disabled=not HAS_DEEPFACE)
+        bio_toggle = st.toggle("Biometrische Analyse aktivieren", value=st.session_state.bio_enabled and HAS_BIOMETRIE, disabled=not HAS_BIOMETRIE)
         st.session_state.bio_enabled = bio_toggle
 
         if st.button("Suche starten", type="primary", use_container_width=True):
