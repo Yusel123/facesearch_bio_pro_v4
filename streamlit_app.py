@@ -3,15 +3,7 @@ Die stärkste Open-Source OSINT-App für Streamlit Cloud.
 Biometrische Reverse-Image-Suche + EXIF/OSINT + Username Enumeration + QR/Barcode
 """
 
-import streamlit as st
-st.set_page_config(
-    page_title="FaceSearch Bio Pro v8.0 OSINT",
-    page_icon="🕵️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-import asyncio, aiohttp, cv2, numpy as np
+import os, asyncio, aiohttp, cv2, numpy as np
 from PIL import Image, ExifTags
 from PIL.ExifTags import GPSTAGS
 import io, hashlib, time, json, sqlite3, warnings
@@ -20,6 +12,7 @@ from datetime import datetime
 from urllib.parse import urlparse, urljoin, quote
 import html as html_module, threading, base64, re, math
 from collections import defaultdict, Counter
+import pandas as pd
 
 # --- Optional Packages with Fallbacks ---
 try: import faiss; FAISS=True
@@ -28,7 +21,7 @@ try: from skimage.feature import hog, local_binary_pattern; from skimage.filters
 except: SKIMAGE=False
 try: from bs4 import BeautifulSoup; BS4=True
 except: BS4=False
-try: from fpdf import FPDF; FPDF=True
+try: from fpdf import FPDF; from fpdf.enums import XPos, YPos; FPDF=True
 except: FPDF=False
 try: from duckduckgo_search import DDGS; DDGS=True
 except: DDGS=False
@@ -432,7 +425,7 @@ USERNAME_SITES = [
     {"name":"WBERC","url":"https://www.wberc.gov.in/search?search={}"},
     {"name":"OERC","url":"https://oerc.orissa.gov.in/search?search={}"},
     {"name":"SERC","url":"https://serc.tn.gov.in/search?search={}"},
-    {"name":"KSEB","url":"https://kseb.in/search?search={}"},
+    {"name":"KSEB","url":"https://www.kseb.in/search?search={}"},
     {"name":"MSEB","url":"https://www.mahadiscom.in/search?search={}"},
     {"name":"GEB","url":"https://www.gseb.com/search?search={}"},
     {"name":"APSPDCL","url":"https://www.apspdcl.in/search?search={}"},
@@ -660,7 +653,7 @@ USERNAME_SITES = [
 ]
 
 # =============================================================================
-# KLASSEN v8.0
+# KLASSEN v8.0 (FIXED)
 # =============================================================================
 
 class AsyncRunner:
@@ -724,18 +717,20 @@ class BiometricAnalyzer:
             return
         proto_path = "deploy.prototxt"
         model_path = "res10_300x300_ssd_iter_140000.caffemodel"
-        if not os.path.exists(proto_path):
+        if not os.path.exists(proto_path) or not os.path.exists(model_path):
             import urllib.request
             try:
+                st.info("⬇️ Lade DNN Face-Detection Model herunter (einmalig, ~10 MB)...")
                 urllib.request.urlretrieve(CONFIG["dnn_proto_url"], proto_path)
                 urllib.request.urlretrieve(CONFIG["dnn_model_url"], model_path)
+                st.success("✅ DNN Model erfolgreich geladen!")
             except Exception as e:
-                st.warning(f"DNN Model Download fehlgeschlagen: {e}")
+                st.warning(f"⚠️ DNN Model Download fehlgeschlagen: {e}. Face-Detection deaktiviert.")
                 return
         try:
             self.dnn_net = cv2.dnn.readNetFromCaffe(proto_path, model_path)
         except Exception as e:
-            st.warning(f"DNN Init fehlgeschlagen: {e}")
+            st.warning(f"⚠️ DNN Init fehlgeschlagen: {e}")
     def detect_faces(self, image: np.ndarray) -> List[Tuple[int,int,int,int,float]]:
         if self.dnn_net is None:
             return []
@@ -747,12 +742,16 @@ class BiometricAnalyzer:
         for i in range(detections.shape[2]):
             conf = detections[0,0,i,2]
             if conf > CONFIG["face_conf_threshold"]:
-                x1, y1, x2, y2 = int(detections[0,0,i,3]*w), int(detections[0,0,i,4]*h), int(detections[0,0,i,5]*w), int(detections[0,0,i,6]*h)
+                x1 = int(detections[0,0,i,3]*w)
+                y1 = int(detections[0,0,i,4]*h)
+                x2 = int(detections[0,0,i,5]*w)
+                y2 = int(detections[0,0,i,6]*h)
                 faces.append((max(0,x1), max(0,y1), min(w,x2), min(h,y2), conf))
         return faces
     def align_face(self, face_img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-        eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml").detectMultiScale(gray, 1.1, 3, minSize=(20,20))
+        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+        eyes = eye_cascade.detectMultiScale(gray, 1.1, 3, minSize=(20,20))
         if len(eyes) >= 2:
             eyes = sorted(eyes, key=lambda e: e[0])[:2]
             eye_centers = [(e[0]+e[2]//2, e[1]+e[3]//2) for e in eyes]
@@ -872,12 +871,14 @@ class AsyncSearcher:
                 results["reverse_image"].extend(r)
         # Biometric Verification of found images
         if results["reverse_image"]:
-            ref_emb = self.biometric.extract_embedding(cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR))
-            social_tasks = [self._verify_image(url, ref_emb, session) for url in results["reverse_image"][:10]]
-            social_results = await asyncio.gather(*social_tasks, return_exceptions=True)
-            for sr in social_results:
-                if isinstance(sr, dict) and sr.get("match"):
-                    results["social_deep"].append(sr)
+            ref_img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if ref_img is not None:
+                ref_emb = self.biometric.extract_embedding(ref_img)
+                social_tasks = [self._verify_image(url, ref_emb, session) for url in results["reverse_image"][:10]]
+                social_results = await asyncio.gather(*social_tasks, return_exceptions=True)
+                for sr in social_results:
+                    if isinstance(sr, dict) and sr.get("match"):
+                        results["social_deep"].append(sr)
         return results
     def _analyze_exif(self, image_bytes: bytes) -> Dict:
         try:
@@ -897,7 +898,6 @@ class AsyncSearcher:
                     data[tag] = str(value)
             if gps:
                 data["GPS"] = gps
-                # Convert to decimal degrees
                 try:
                     lat = self._convert_gps(gps.get("GPSLatitude"), gps.get("GPSLatitudeRef"))
                     lon = self._convert_gps(gps.get("GPSLongitude"), gps.get("GPSLongitudeRef"))
@@ -958,12 +958,11 @@ class AsyncSearcher:
                     json_data = await resp.json()
                     return [r["image_url"] for r in json_data.get("results", [])[:CONFIG["max_results_per_engine"]]]
                 return []
-        except Exception as e:
+        except Exception:
             return []
     async def bing_visual_search(self, image_bytes: bytes, session: aiohttp.ClientSession) -> List[str]:
         await self.rate_limiter.acquire("bing.com")
         try:
-            # Bing Visual Search via their image upload endpoint (unofficial, may break)
             data = aiohttp.FormData()
             data.add_field("image", io.BytesIO(image_bytes), filename="search.jpg", content_type="image/jpeg")
             async with session.post("https://www.bing.com/images/search?view=detailv2&iss=sbiupload", data=data, headers={"User-Agent":"Mozilla/5.0"}) as resp:
@@ -997,7 +996,6 @@ class AsyncSearcher:
         if not DDGS:
             return []
         try:
-            # DDGS doesn't support image upload directly, but we can search for similar images by hash
             img_hash = hashlib.md5(image_bytes).hexdigest()
             with DDGS() as ddgs:
                 results = ddgs.images(img_hash, max_results=CONFIG["max_results_per_engine"])
@@ -1038,15 +1036,12 @@ class AsyncSearcher:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True) as resp:
                     status = resp.status
                     final_url = str(resp.url)
-                    # Heuristics for existence
                     exists = False
                     if status == 200:
-                        # Check if we were redirected to a login page or error page
                         if "login" in final_url.lower() or "signin" in final_url.lower():
                             exists = False
                         else:
                             text = await resp.text()
-                            # Check for common "not found" indicators
                             not_found_indicators = [
                                 "not found", "404", "doesn't exist", "does not exist",
                                 "no user", "profile not found", "page not found",
@@ -1054,7 +1049,6 @@ class AsyncSearcher:
                             ]
                             text_lower = text.lower()
                             exists = not any(ind in text_lower for ind in not_found_indicators)
-                            # Also check content length - empty profiles often indicate non-existence
                             if len(text) < 500:
                                 exists = False
                     elif status == 404:
@@ -1094,81 +1088,144 @@ class AsyncSearcher:
             pdf = FPDF()
             pdf.add_page()
             pdf.set_font("Arial", "B", 16)
-            pdf.cell(0, 10, "FaceSearch Bio Pro v8.0 OSINT Report", ln=True, align="C")
-            pdf.set_font("Arial", "", 10)
-            pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "FaceSearch Bio Pro v8.0 OSINT Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                pdf.set_font("Arial", "", 10)
+                pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+            else:
+                pdf.cell(0, 10, "FaceSearch Bio Pro v8.0 OSINT Report", ln=True, align="C")
+                pdf.set_font("Arial", "", 10)
+                pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
             pdf.ln(10)
 
             # Image Hashes
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Image Hashes", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "Image Hashes", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "Image Hashes", ln=True)
             pdf.set_font("Arial", "", 10)
             for hash_type, hash_val in results.get("hashes", {}).items():
-                pdf.cell(0, 6, f"{hash_type.upper()}: {hash_val}", ln=True)
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, f"{hash_type.upper()}: {hash_val}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, f"{hash_type.upper()}: {hash_val}", ln=True)
             pdf.ln(5)
 
             # EXIF
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "EXIF Metadata", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "EXIF Metadata", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "EXIF Metadata", ln=True)
             pdf.set_font("Arial", "", 10)
             exif = results.get("exif", {})
             if exif:
                 for key, val in exif.items():
                     if key != "GPS":
-                        pdf.cell(0, 6, f"{key}: {str(val)[:100]}", ln=True)
+                        safe_val = str(val)[:100].encode('latin-1', 'replace').decode('latin-1')
+                        if FPDF and 'XPos' in dir():
+                            pdf.cell(0, 6, f"{key}: {safe_val}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                        else:
+                            pdf.cell(0, 6, f"{key}: {safe_val}", ln=True)
             else:
-                pdf.cell(0, 6, "No EXIF data found", ln=True)
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, "No EXIF data found", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, "No EXIF data found", ln=True)
             pdf.ln(5)
 
             # QR Codes
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "QR/Barcode Codes", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "QR/Barcode Codes", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "QR/Barcode Codes", ln=True)
             pdf.set_font("Arial", "", 10)
             qr_codes = results.get("qr_codes", [])
             if qr_codes:
                 for qr in qr_codes:
-                    pdf.cell(0, 6, f"Type: {qr['type']}, Data: {qr['data'][:100]}", ln=True)
+                    safe_data = qr['data'][:100].encode('latin-1', 'replace').decode('latin-1')
+                    if FPDF and 'XPos' in dir():
+                        pdf.cell(0, 6, f"Type: {qr['type']}, Data: {safe_data}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    else:
+                        pdf.cell(0, 6, f"Type: {qr['type']}, Data: {safe_data}", ln=True)
             else:
-                pdf.cell(0, 6, "No QR/Barcodes found", ln=True)
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, "No QR/Barcodes found", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, "No QR/Barcodes found", ln=True)
             pdf.ln(5)
 
             # Reverse Image Results
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Reverse Image Search Results", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "Reverse Image Search Results", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "Reverse Image Search Results", ln=True)
             pdf.set_font("Arial", "", 10)
             for url in results.get("reverse_image", [])[:20]:
-                pdf.cell(0, 6, url[:120], ln=True)
+                safe_url = url[:120].encode('latin-1', 'replace').decode('latin-1')
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, safe_url, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, safe_url, ln=True)
             pdf.ln(5)
 
             # Social Deep Search
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Biometric Social Media Matches", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "Biometric Social Media Matches", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "Biometric Social Media Matches", ln=True)
             pdf.set_font("Arial", "", 10)
             for match in results.get("social_deep", [])[:20]:
                 status = "MATCH" if match["match"] else "No Match"
-                pdf.cell(0, 6, f"[{status}] {match['url'][:100]} (Sim: {match['similarity']:.3f})", ln=True)
+                safe_url = match['url'][:100].encode('latin-1', 'replace').decode('latin-1')
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, f"[{status}] {safe_url} (Sim: {match['similarity']:.3f})", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, f"[{status}] {safe_url} (Sim: {match['similarity']:.3f})", ln=True)
             pdf.ln(5)
 
             # Username Enumeration
             pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Username Enumeration Results", ln=True)
+            if FPDF and 'XPos' in dir():
+                pdf.cell(0, 10, "Username Enumeration Results", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            else:
+                pdf.cell(0, 10, "Username Enumeration Results", ln=True)
             pdf.set_font("Arial", "", 10)
             found_accounts = [u for u in results.get("username_enum", []) if u.get("exists")]
             if found_accounts:
                 for acc in found_accounts[:30]:
-                    pdf.cell(0, 6, f"FOUND: {acc['site']} -> {acc['url'][:100]}", ln=True)
+                    safe_site = acc['site'].encode('latin-1', 'replace').decode('latin-1')
+                    safe_url = acc['url'][:100].encode('latin-1', 'replace').decode('latin-1')
+                    if FPDF and 'XPos' in dir():
+                        pdf.cell(0, 6, f"FOUND: {safe_site} -> {safe_url}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    else:
+                        pdf.cell(0, 6, f"FOUND: {safe_site} -> {safe_url}", ln=True)
             else:
-                pdf.cell(0, 6, "No accounts found with this username", ln=True)
+                if FPDF and 'XPos' in dir():
+                    pdf.cell(0, 6, "No accounts found with this username", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                else:
+                    pdf.cell(0, 6, "No accounts found with this username", ln=True)
 
             return pdf.output(dest="S").encode("latin-1")
         except Exception as e:
             return f"Report generation failed: {e}".encode("utf-8")
 
 # =============================================================================
-# STREAMLIT UI v8.0
+# STREAMLIT UI v8.0 (FIXED)
 # =============================================================================
 
 def main():
+    st.set_page_config(
+        page_title="FaceSearch Bio Pro v8.0 OSINT",
+        page_icon="🕵️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
     st.title("🕵️ FaceSearch Bio Pro v8.0 OSINT SUITE")
     st.markdown("""
     **Die stärkste Open-Source OSINT-App für Streamlit Cloud**
@@ -1221,15 +1278,15 @@ def run_image_only_mode():
         # Display uploaded image
         col1, col2 = st.columns([1, 2])
         with col1:
-            st.image(image_bytes, caption="Hochgeladenes Bild", use_container_width=True)
+            st.image(image_bytes, caption="Hochgeladenes Bild", width=300)
 
         with col2:
             st.subheader("📊 Schnellanalyse")
 
-            # Quick analysis
-            hashes = AsyncSearcher()._compute_hashes(image_bytes)
-            exif = AsyncSearcher()._analyze_exif(image_bytes)
-            qr_codes = AsyncSearcher()._scan_qr(image_bytes)
+            searcher = AsyncSearcher()
+            hashes = searcher._compute_hashes(image_bytes)
+            exif = searcher._analyze_exif(image_bytes)
+            qr_codes = searcher._scan_qr(image_bytes)
 
             with st.expander("🔐 Image Hashes", expanded=True):
                 for k, v in hashes.items():
@@ -1245,7 +1302,6 @@ def run_image_only_mode():
                         st.success(f"🌍 GPS gefunden: {gps['lat']:.6f}, {gps['lon']:.6f}")
                         if "GPS_Address" in exif:
                             st.info(f"📍 Adresse: {exif['GPS_Address']}")
-                        # Show map link
                         st.markdown(f"[🗺️ Auf Google Maps anzeigen](https://www.google.com/maps?q={gps['lat']},{gps['lon']})")
                 else:
                     st.info("Keine EXIF-Daten gefunden")
@@ -1382,7 +1438,6 @@ def run_username_mode():
 
             # Detailed table
             with st.expander("📋 Vollständige Ergebnistabelle"):
-                import pandas as pd
                 df_data = []
                 for r in results:
                     df_data.append({
@@ -1481,7 +1536,7 @@ def run_combined_mode():
                     col_b.metric("Bio-Matches", len([m for m in img_results.get("social_deep", []) if m["match"]]))
                     col_c.metric("Accounts gefunden", len(found))
 
-                    # Cross-reference: Check if any found image URLs contain the username
+                    # Cross-reference
                     st.markdown("---")
                     st.write("**Kreuzreferenz Bild ↔ Username:**")
                     username_in_urls = [url for url in img_results.get("reverse_image", []) if username.lower() in url.lower()]
