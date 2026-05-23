@@ -1,16 +1,19 @@
-streamlit>=1.28
-aiohttp>=3.9
-faiss-cpu>=1.7
-onnxruntime>=1.16
-fake-useragent>=1.4
-structlog>=23.0
-opencv-python-headless
-duckduckgo-search>=3.9
-beautifulsoup4>=4.12
-lxml>=4.9
-requests>=2.31
-pillow>=10.0
-fpdf2>=2.7
-plotly>=5.17
-pandas>=2.0
-numpy>=1.24
+# FaceSearch Bio Pro v8.0 OSINT SUITE
+streamlit>=1.28.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+scikit-image>=0.21.0
+aiohttp>=3.8.0
+# duckduckgo-search>=3.9.0  # Optional, DDGS ist oft instabil in Cloud
+fpdf2>=2.7.0
+cachetools>=5.3.0
+beautifulsoup4>=4.12.0
+# faiss-cpu>=1.7.4  # Optional, schwere Dependency
+requests>=2.31.0
+lxml>=4.9.0
+# deepface>=0.0.93  # Optional, sehr schwer (TensorFlow)
+# imagehash>=4.3.1  # Optional
+# geopy>=2.4.0  # Optional
+# waybackpy>=3.0.6  # Optional
+# pyzbar>=0.1.9  # Optional, benötigt zbar system-lib
